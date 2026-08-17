@@ -31,6 +31,85 @@ PORT = int(os.environ.get("GIT_HTTP_PORT", "8080"))
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # Safe path chars for browsing; reject anything that could escape or inject.
 SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/ -]+$")
+# README candidates, in priority order
+README_CANDIDATES = [
+    "README.md", "readme.md", "README.MD",
+    "Readme.md", "README.markdown", "README.txt", "README",
+]
+
+
+def git(repo_path, *args):
+    """Run git against a bare repo. Returns stdout or None on failure."""
+    proc = subprocess.run(
+        ["git", "--git-dir", repo_path] + list(args),
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def list_repos():
+    """Return sorted list of bare repo names under REPOS_ROOT."""
+    if not os.path.isdir(REPOS_ROOT):
+        return []
+    out = []
+    for entry in sorted(os.listdir(REPOS_ROOT)):
+        if entry.endswith(".git") and os.path.isdir(os.path.join(REPOS_ROOT, entry)):
+            out.append(entry[:-4])
+    return out
+
+
+def get_readme(repo):
+    """Return (readme_path, raw_markdown) for the repo's README, or None."""
+    root = git(repo, "ls-tree", "HEAD")
+    if root is None:
+        return None
+    names = []
+    for line in root.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        meta_parts = parts[0].split()
+        if len(meta_parts) < 3:
+            continue
+        if meta_parts[1] == "blob":
+            names.append(parts[1].strip())
+    for candidate in README_CANDIDATES:
+        if candidate in names:
+            content = git(repo, "show", f"HEAD:{candidate}")
+            if content is not None:
+                return candidate, content
+    return None
+
+
+README_LIBS = """<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+"""
+
+README_VIEWER_JS = """
+<script>
+(function () {
+  var raw = document.getElementById('readme-raw');
+  if (!raw || typeof marked === 'undefined') return;
+  var html = marked.parse(raw.textContent);
+  if (typeof DOMPurify !== 'undefined') {
+    html = DOMPurify.sanitize(html, {ADD_ATTR: ['target']});
+  }
+  var host = location.hostname;
+  html = html.replace(/href="([^"]+)"/g, function (m, href) {
+    if (/^(https?:|mailto:|#)/i.test(href) || href.startsWith('//')) return m;
+    if (href.startsWith('/')) return m;
+    return 'href="https://' + host + '/repo/' + REPO_NAME_JS + '/blob/' + href + '"';
+  });
+  document.getElementById('readme').innerHTML = html;
+})();
+</script>
+"""
+
+
+def readme_viewer_html(repo_name):
+    return README_LIBS + README_VIEWER_JS.replace("REPO_NAME_JS", repo_name)
 
 PAGE_CSS = """
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#1f2328;line-height:1.5}
@@ -44,6 +123,16 @@ th{background:#f6f8fa;font-weight:600}
 pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:1rem;overflow-x:auto;font-size:.85rem}
 .muted{color:#57606a;font-size:.85rem}
 code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
+#readme-wrapper{margin-top:1.5rem}
+#readme-wrapper h2{border-bottom:1px solid #d0d7de;padding-bottom:.3rem}
+#readme{line-height:1.6}
+#readme img{max-width:100%}
+#readme h1,#readme h2,#readme h3,#readme h4{border-bottom:1px solid #d0d7de;padding-bottom:.3rem;margin-top:1.2rem}
+#readme pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:1rem;overflow-x:auto;font-size:.85rem}
+#readme code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
+#readme table{border-collapse:collapse;margin:.5rem 0}
+#readme th,#readme td{border:1px solid #d0d7de;padding:.3rem .6rem;text-align:left}
+#readme blockquote{border-left:3px solid #d0d7de;margin:.5rem 0;padding:.1rem 1rem;color:#57606a}
 """
 
 
@@ -176,6 +265,18 @@ def repo_page(name, repo, sub):
 <div class="breadcrumb">📁 {breadcrumb}</div>
 <p><a href="/repo/{html.escape(name)}/log">commit log</a> · <a href="/">all repos</a></p>
 <table><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
+
+    readme = get_readme(repo)
+    if readme:
+        readme_path, readme_content = readme
+        body += f"""
+<div id="readme-wrapper">
+<h2>README <span class="muted">({html.escape(readme_path)})</span></h2>
+<pre id="readme-raw" hidden>{html.escape(readme_content)}</pre>
+<div id="readme"><p class="muted">Loading README…</p></div>
+</div>
+{readme_viewer_html(name)}"""
+
     return page(f"{name} — Git Server", body)
 
 
