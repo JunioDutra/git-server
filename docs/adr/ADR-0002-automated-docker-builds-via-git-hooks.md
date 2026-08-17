@@ -49,6 +49,15 @@ keeping the git LXC free from Docker workloads and able to stay tiny.
 - A build node with a Docker daemon is reachable from the git server
   (DOCKER_HOST / docker context / buildx driver).
 
+### Build node (k8s-Master)
+
+- **Hostname**: `k8s-Master` (also resolvable as `k8s-master.lan`)
+- **IP**: `192.168.2.247` (confirmed reachable, 0% packet loss)
+- **Role**: dedicated remote Docker build engine for this pipeline.
+  The git server (LXC 109) connects to it via `DOCKER_HOST` /
+  `docker context`, so no Docker daemon ever runs inside the git LXC
+  (F-003).
+
 ---
 
 ## 2. Decisions
@@ -99,28 +108,41 @@ keeping the git LXC free from Docker workloads and able to stay tiny.
     repos by the bare repo itself; it needs a config step per repo —
     rejected for the same automation reason.
 
-### ADR-0002-D3: Dockerfile detection — root only, via `git archive`
+### ADR-0002-D3: Build config — `repository.yaml` at repo root
 
-- **Motivation**: building arbitrary commits requires materializing
-  the tree without touching the bare repo working state (ADR-0001
-  D10 lesson).
+- **Motivation**: the build pipeline must know *how* to build each
+  repo. Hard-coding "root `Dockerfile` only" is too rigid: a repo may
+  keep its Dockerfile in a subdirectory (e.g. `docker/app/Dockerfile`)
+  or need build args. The repo itself should declare its build
+  intent.
 - **Decision**:
-  - The hook exports the pushed tree with `git archive <sha> |
-    tar -x -C "$workdir"`.
-  - Detection: `[ -f "$workdir/Dockerfile" ]` — root only. Sub-tree
-    Dockerfiles do not trigger builds (documented; can be relaxed
-    later with an explicit opt-in list).
-  - The workdir is a `mktemp -d` per build; ownership `git`.
+  - Every repo that wants automated builds MUST contain a
+    `repository.yaml` at the **root** of the repository.
+  - The file declares the Dockerfile path (relative to repo root):
+    ```yaml
+    # repository.yaml
+    dockerfile: Dockerfile        # or e.g. docker/app/Dockerfile
+    ```
+  - The hook reads `repository.yaml`, resolves the relative path, and
+    builds **only if the referenced Dockerfile exists** in the pushed
+    tree. If `repository.yaml` is absent → no build (silent skip).
+    If the file exists but references a missing Dockerfile → build
+    fails loudly (D7).
+  - The Dockerfile path is validated against path traversal
+    (`..`, absolute paths) before use — same spirit as the HTTP
+    service's `safe_subpath()` (ADR-0001/D8).
 - **Consequences**:
-  - No worktree ops on bare repos — safe per ADR-0001/D10.
-  - Archive shows the tree exactly as committed; no uncommitted
-    surprises.
+  - Explicit opt-in per repo: new repos are NOT built until they add
+    `repository.yaml`. No accidental builds.
+  - The config will be reused by the next task (pipeline that
+    consumes this same field).
 - **Alternatives**:
-  - `git ls-tree -r --name-only HEAD | grep -E '(^|/)Dockerfile'`
-    and still archive: works, but the tar step is needed anyway for
-    the build context.
-  - `git worktree add` on the bare: rejected — this EXACTLY
-    recreates the ADR-0001/D10 foot-gun.
+  - Auto-detect any `Dockerfile` anywhere in the tree: rejected —
+    ambiguous when multiple exist, and implicit behavior surprises
+    repo owners.
+  - Hard-code root `Dockerfile` only: rejected — fails the
+    subdirectory use case and couples the pipeline to a convention
+    the repo doesn't control.
 
 ### ADR-0002-D4: Build engine — `docker buildx` connected to a remote
 - **Motivation**: (F-003) the git server runs Alpine with no Docker
@@ -217,12 +239,14 @@ Client push ──> SSH ──> git@192.168.2.163 (LXC 109)
                           ▼
               scripts/build-image.sh
                   │  git archive | tar → $workdir
-                  │  [ -f Dockerfile ]  ──no──▶ exit 0 (skip)
+                  │  read repository.yaml → dockerfile path
+                  │  [ -f $dockerfile ]  ──no──▶ exit 0 (skip)
                   │  yes
                   ▼
-        docker buildx ──remote DOCKER_HOST──▶ Build node (docker daemon)
-                  │                              │ build images
-                  ▼                              ▼
+        docker buildx ──DOCKER_HOST──▶ k8s-Master (192.168.2.247)
+                  │                      docker daemon
+                  │                      │ build images
+                  ▼                      ▼
             registry:5000/<repo>:<sha>   (push, cache bounded 24h)
                   │
                   ▼
@@ -232,20 +256,20 @@ Client push ──> SSH ──> git@192.168.2.163 (LXC 109)
 ## 4. Files to be implemented (future work)
 
 - `/home/git/hooks/post-receive` — canonical hook script
-- `/home/git/hooks/build-image.sh` — archive→build→tag→push→prune
+- `/home/git/hooks/build-image.sh` — archive→read yaml→build→tag→push→prune
 - `scripts/install-hooks.sh` — install hook into every current/repo
   bare repo; used by deploy for legacy repos
 - `scripts/build-node-setup.sh` — provision Docker engine +
-  registry on the build node (TLS option)
+  registry on k8s-Master (192.168.2.247) (TLS option)
 
 ## 5. Summary table
 
 | # | Decision | Status |
 |---|----------|--------|
 | D1 | post-receive git hook as trigger | Proposed |
-| D1 | Central hook + template for new repos + installer for legacy | Proposed |
-| D3 | Root Dockerfile detection via `git archive` (no worktree ops) | Proposed |
-| D4 | docker buildx with remote driver → build node | Proposed |
+| D2 | Central hook + template for new repos + installer for legacy | Proposed |
+| D3 | Build config via root `repository.yaml` (dockerfile path, opt-in) | Proposed |
+| D4 | docker buildx with remote driver → k8s-Master (192.168.2.247) | Proposed |
 | D5 | Local registry + `<sha>` and `:latest` tags | Proposed |
 | D6 | Cleanup: rm workdir + remote prune (24h cache) | Proposed |
 | D7 | Async build, logs, don't block push | Proposed |
