@@ -89,6 +89,27 @@ README_VIEWER_JS = """
 def readme_viewer_html(repo_name):
     return README_LIBS + README_VIEWER_JS.replace("REPO_NAME_JS", repo_name)
 
+
+def js_str(value):
+    """Escape a value for safe embedding inside a JS string literal."""
+    return value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+
+
+JS_DELETE_REPO = """
+<script>
+function deleteRepo(name) {
+  if (!confirm('Delete repository "' + name + '"?\\nThis cannot be undone.')) return;
+  fetch('/repo/' + encodeURIComponent(name), {method: 'DELETE'})
+    .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
+    .then(function (res) {
+      if (res.ok) { location.href = '/'; }
+      else { alert('Error: ' + (res.d.error || 'failed')); }
+    })
+    .catch(function () { alert('Network error'); });
+}
+</script>
+"""
+
 PAGE_CSS = """
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#1f2328;line-height:1.5}
 h1{font-size:1.5rem;border-bottom:1px solid #d0d7de;padding-bottom:.5rem}
@@ -117,9 +138,11 @@ code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
 .create-box input[type=text]{flex:1;min-width:200px;padding:.45rem .6rem;border:1px solid #d0d7de;border-radius:6px;font-size:.9rem}
 .create-box button{padding:.45rem 1rem;background:#1f883d;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.9rem}
 .create-box button:hover{background:#1a7f37}
-.create-msg{margin-top:.6rem;font-size:.85rem}
+.create-msg{font-size:.85rem}
 .create-msg.ok{color:#1a7f37}
 .create-msg.err{color:#cf222e}
+.btn-danger{padding:.35rem .8rem;background:#cf222e;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.8rem}
+.btn-danger:hover{background:#b51f2b}
 """
 
 
@@ -180,6 +203,20 @@ def create_bare_repo(name):
     )
     if proc.returncode != 0:
         return False, proc.stderr.strip() or "git init failed"
+    return True, path
+
+
+def delete_bare_repo(name):
+    """Delete a bare repo at REPOS_ROOT/<name>.git. Returns (ok, message)."""
+    if not name:
+        return False, "missing name"
+    if not NAME_RE.match(name) or name in (".", ".."):
+        return False, "invalid name (allowed: letters, digits, . _ -)"
+    path = os.path.join(REPOS_ROOT, f"{name}.git")
+    if not os.path.isdir(path):
+        return False, f"repo not found: {name}"
+    import shutil
+    shutil.rmtree(path)
     return True, path
 
 
@@ -262,8 +299,9 @@ def repo_page(name, repo, sub):
         if head is None:
             body = f"""<h1>{html.escape(name)}</h1>
 <p class="muted">Empty repository — no commits yet.</p>
+<p><button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <p><a href="/">← back</a></p>"""
-            return page(f"{name} — Git Server", body)
+            return page(f"{name} — Git Server", body + JS_DELETE_REPO)
         return None
 
     rows = []
@@ -293,7 +331,8 @@ def repo_page(name, repo, sub):
 
     body = f"""<h1>{html.escape(name)}</h1>
 <div class="breadcrumb">📁 {breadcrumb}</div>
-<p><a href="/repo/{html.escape(name)}/log">commit log</a> · <a href="/">all repos</a></p>
+<p><a href="/repo/{html.escape(name)}/log">commit log</a> · <a href="/">all repos</a>
+ · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <table><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
 
     readme = get_readme(repo)
@@ -307,7 +346,7 @@ def repo_page(name, repo, sub):
 </div>
 {readme_viewer_html(name)}"""
 
-    return page(f"{name} — Git Server", body)
+    return page(f"{name} — Git Server", body + JS_DELETE_REPO)
 
 
 def blob_page(name, repo, sub):
@@ -386,6 +425,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(201, {"ok": True, "repo": name, "path": msg})
         else:
             status = 409 if "already exists" in msg else 400
+            self._send_json(status, {"ok": False, "error": msg})
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if not path.startswith("/repo/"):
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        name = path[len("/repo/"):]
+        if "/" in name:
+            self._send_json(400, {"ok": False, "error": "invalid repo name"})
+            return
+        ok, msg = delete_bare_repo(name)
+        if ok:
+            self._send_json(200, {"ok": True, "repo": name, "path": msg})
+        else:
+            status = 404 if "not found" in msg else 400
             self._send_json(status, {"ok": False, "error": msg})
 
     def do_GET(self):
