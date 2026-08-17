@@ -38,28 +38,6 @@ README_CANDIDATES = [
 ]
 
 
-def git(repo_path, *args):
-    """Run git against a bare repo. Returns stdout or None on failure."""
-    proc = subprocess.run(
-        ["git", "--git-dir", repo_path] + list(args),
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    return proc.stdout
-
-
-def list_repos():
-    """Return sorted list of bare repo names under REPOS_ROOT."""
-    if not os.path.isdir(REPOS_ROOT):
-        return []
-    out = []
-    for entry in sorted(os.listdir(REPOS_ROOT)):
-        if entry.endswith(".git") and os.path.isdir(os.path.join(REPOS_ROOT, entry)):
-            out.append(entry[:-4])
-    return out
-
-
 def get_readme(repo):
     """Return (readme_path, raw_markdown) for the repo's README, or None."""
     root = git(repo, "ls-tree", "HEAD")
@@ -133,6 +111,15 @@ code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
 #readme table{border-collapse:collapse;margin:.5rem 0}
 #readme th,#readme td{border:1px solid #d0d7de;padding:.3rem .6rem;text-align:left}
 #readme blockquote{border-left:3px solid #d0d7de;margin:.5rem 0;padding:.1rem 1rem;color:#57606a}
+.create-box{border:1px solid #d0d7de;border-radius:8px;padding:1rem;margin:1.5rem 0;background:#f6f8fa}
+.create-box h2{margin:0 0 .6rem;font-size:1rem}
+.create-box form{display:flex;gap:.5rem;flex-wrap:wrap}
+.create-box input[type=text]{flex:1;min-width:200px;padding:.45rem .6rem;border:1px solid #d0d7de;border-radius:6px;font-size:.9rem}
+.create-box button{padding:.45rem 1rem;background:#1f883d;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.9rem}
+.create-box button:hover{background:#1a7f37}
+.create-msg{margin-top:.6rem;font-size:.85rem}
+.create-msg.ok{color:#1a7f37}
+.create-msg.err{color:#cf222e}
 """
 
 
@@ -213,9 +200,52 @@ def index_page():
         for r in repos
     ) or '<tr><td colspan="2" class="muted">No repositories yet.</td></tr>'
     body = f"""<h1>Git Server</h1>
+<div class="create-box">
+<h2>Create a new repository</h2>
+<form id="create-form" autocomplete="off">
+<input type="text" id="repo-name" placeholder="repo-name (letters, digits, . _ -)" required>
+<button type="submit">Create</button>
+</form>
+<div id="create-msg" class="create-msg"></div>
+</div>
 <p class="muted">{len(repos)} repository(ies)</p>
 <table><thead><tr><th>Repository</th><th>Type</th></tr></thead><tbody>{rows}</tbody></table>
-<p class="muted">Create via <code>POST /create</code> with <code>{{"name": "my-repo"}}</code>.</p>"""
+<p class="muted">API: <code>POST /create</code> with <code>{{"name": "my-repo"}}</code>.</p>
+<script>
+(function () {{
+  var form = document.getElementById('create-form');
+  var input = document.getElementById('repo-name');
+  var msg = document.getElementById('create-msg');
+  form.addEventListener('submit', function (e) {{
+    e.preventDefault();
+    var name = input.value.trim();
+    if (!name) return;
+    if (!confirm('Create repository "' + name + '"?')) return;
+    msg.textContent = '';
+    msg.className = 'create-msg';
+    fetch('/create', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{name: name}})
+    }}).then(function (r) {{
+      return r.json().then(function (d) {{ return {{ok: r.ok, d: d}}; }});
+    }}).then(function (res) {{
+      if (res.ok) {{
+        msg.textContent = '✓ Repository "' + res.d.repo + '" created.';
+        msg.className = 'create-msg ok';
+        input.value = '';
+        setTimeout(function () {{ location.href = '/repo/' + encodeURIComponent(res.d.repo) + '/'; }}, 800);
+      }} else {{
+        msg.textContent = '✗ ' + (res.d.error || 'failed');
+        msg.className = 'create-msg err';
+      }}
+    }}).catch(function () {{
+      msg.textContent = '✗ network error';
+      msg.className = 'create-msg err';
+    }});
+  }});
+}})();
+</script>"""
     return page("Git Server", body)
 
 
