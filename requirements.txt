@@ -1,0 +1,1 @@
+# git-http-server: repo creation service (stdlib only, no deps)
