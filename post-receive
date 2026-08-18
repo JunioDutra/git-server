@@ -1,0 +1,91 @@
+#!/bin/sh
+# post-receive hook (canonical, ADR-0002-D1/D2 + ADR-0003-D2/D4)
+# Dispatcher: reads pushed refs from stdin (old new ref) and triggers
+#   - automated build (ADR-0002)  via build-image.sh
+#   - mirror sync (ADR-0003)      via mirror-sync.sh
+# both in background, so the push never blocks.
+#
+# Installed at /home/git/hooks/post-receive and symlinked/templated into
+# every bare repo. This is the ONLY canonical copy.
+#
+# Format of stdin (git): <oldrev> <newrev> <refname>
+# Builds only for refs/heads/* pushes; deletions are ignored for build.
+# Mirror sync handles both pushes and deletions (refs/heads/*).
+
+set -u
+
+# Resolve the CANONICAL hook dir even when invoked via a symlink
+# (e.g. /home/git/repos/<name>.git/hooks/post-receive -> /home/git/hooks/post-receive).
+# Using readlink -f ensures $0 resolves to the real canonical path, so
+# $HOOK_DIR points at /home/git/hooks and the canonical scripts are used.
+# (Without this, dirname $0 returned the symlink dir, so the hook used
+# stale per-repo copies of build-image.sh/mirror-sync.sh instead of the
+# canonical ones — causing mirror sync to fail only on real SSH pushes.)
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+HOOK_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+GIT_DIR_REPO="$(pwd)"          # bare repo dir (hooks run with cwd = repo)
+
+# Canonical scripts live next to this hook
+BUILD_SCRIPT="$HOOK_DIR/build-image.sh"
+MIRROR_SCRIPT="$HOOK_DIR/mirror-sync.sh"
+BUILD_LOGS="/home/git/logs/builds"
+MIRROR_LOGS="/home/git/logs/mirrors"
+
+# Resolve repo name from bare dir path (e.g. /home/git/repos/foo.git -> foo)
+REPO_NAME=$(basename "$GIT_DIR_REPO" .git)
+
+mkdir -p "$BUILD_LOGS" "$MIRROR_LOGS"
+
+# Collect refs for mirror sync (newrev:ref pairs; only refs/heads/*)
+MIRROR_PAIRS=""
+# Build triggers (branch sha)
+BUILD_SPECS=""
+
+# Process each ref line
+while read -r oldrev newrev ref; do
+  [ -z "$ref" ] && continue
+  case "$ref" in
+    refs/heads/*)
+      BRANCH=${ref#refs/heads/}
+      SHA=$newrev
+      SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
+
+      # Deletion (newrev all zeros) -> nothing to build, mirror as delete
+      case "$newrev" in
+        0000000000000000000000000000000000000000)
+          MIRROR_PAIRS="$MIRROR_PAIRS $newrev:$ref"
+          continue
+          ;;
+      esac
+
+      MIRROR_PAIRS="$MIRROR_PAIRS $newrev:$ref"
+      BUILD_SPECS="$BUILD_SPECS $BRANCH:$SHA:$REPO_NAME"
+      ;;
+  esac
+done
+
+# Async: build (ADR-0002)
+if [ -n "$BUILD_SPECS" ]; then
+  for spec in $BUILD_SPECS; do
+    BRANCH=${spec%%:*}
+    rest=${spec#*:}
+    SHA=${rest%%:*}
+    SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
+    (
+      exec "$BUILD_SCRIPT" "$GIT_DIR_REPO" "$BRANCH" "$SHA" "$REPO_NAME" \
+        >> "$BUILD_LOGS/$REPO_NAME.log" 2>&1
+    ) &
+    echo "[git-server] queued build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
+  done
+fi
+
+# Async: mirror sync (ADR-0003)
+if [ -n "$MIRROR_PAIRS" ]; then
+  (
+    exec "$MIRROR_SCRIPT" "$GIT_DIR_REPO" "$REPO_NAME" $MIRROR_PAIRS \
+      >> "$MIRROR_LOGS/$REPO_NAME.log" 2>&1
+  ) &
+  echo "[git-server] queued mirror sync for $REPO_NAME" >&2
+fi
+
+exit 0

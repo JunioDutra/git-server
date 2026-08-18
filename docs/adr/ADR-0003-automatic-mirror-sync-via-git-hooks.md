@@ -1,6 +1,6 @@
 # ADR-0003: Automatic mirror/sync of repositories via git hooks
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-08-17
 - **Context**: Git server (LXC 109) + automatic mirror sync on push
 - **Tags**: `adr`, `git-hooks`, `mirror`, `sync`, `repository.yaml`, `homelab`
@@ -254,30 +254,69 @@ Mirror destinations: git@github.com:acme/foo.git
                      https://github.com/acme/foo.git  (creds in /home/git/.git-credentials)
 ```
 
-## 4. Files to be implemented (future work)
+## 4. Files implemented
 
 - `/home/git/hooks/post-receive` — canonical hook (dispatcher: build +
-  mirror) — **already planned in ADR-0002; extended here**
+  mirror) — **implemented & verified E2E (2026-08-18)**
 - `/home/git/hooks/mirror-sync.sh` — read `repository.yaml` mirrors →
-  push refs → log per mirror
-- `scripts/install-hooks.sh` — idempotent installer (already planned
-  in ADR-0002); re-run once to cover legacy repos with the new hook
+  push refs → log per mirror — **implemented & verified E2E**
+- `scripts/install-hooks.sh` — idempotent installer (from ADR-0002);
+  re-run once to cover legacy repos with the new hook
 - `/home/git/logs/mirrors/` — per-repo mirror logs (created on demand)
 - (Ops) `/home/git/.ssh/` + `~/.ssh/config` + `.git-credentials` —
   per-mirror credentials, out of repo trees
+
+## 4a. Implementation notes / lessons learned (2026-08-18)
+
+The E2E test surfaced three gotchas worth recording:
+
+1. **`dubious ownership`**: the hook runs as `root` (sshd session
+   user) while the bare repos are owned by user `git`. Modern git
+   refuses to operate on a repo owned by another user. Fix: set
+   `git config --global safe.directory '*'` for **both** `root` and
+   `git`. Without this, the internal `git push` to the mirror failed
+   before even reaching SSH.
+
+2. **Hook dir resolution through symlinks**: the canonical hook is
+   symlinked into each repo
+   (`.../<name>.git/hooks/post-receive -> /home/git/hooks/post-receive`).
+   The dispatcher computed `HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"`
+   from `$0` — but when invoked via the symlink, `dirname $0` returns
+   the **repo's** hooks dir, so `$HOOK_DIR` pointed at the repo and
+   the hook used **stale per-repo copies** of `mirror-sync.sh` instead
+   of the canonical one. This is why mirror sync worked when invoked
+   manually (canonical path) but failed on real SSH pushes (symlink
+   path). Fix: resolve the canonical path first with
+   `SELF="$(readlink -f "$0")"` and derive `HOOK_DIR` from `$SELF`.
+
+3. **HOME / ssh identity pinning**: the hook may run as root while the
+   mirror credentials live under `/home/git/.ssh` (user `git`). The
+   script forces `export HOME=/home/git` and pins
+   `GIT_SSH_COMMAND="ssh -i /home/git/.ssh/id_ed25519 -o
+   IdentitiesOnly=yes -o UserKnownHostsFile=/home/git/.ssh/known_hosts
+   -o StrictHostKeyChecking=yes"` so the correct key + known_hosts are
+   used regardless of the uid running the hook.
+
+**External mirrors (e.g. GitHub)**: the script is URL-generic
+(`ssh://*`, `git@*`, `http(s)://*`). To mirror to GitHub over SSH,
+add `/home/git/.ssh/id_ed25519.pub` as a deploy key / account SSH key
+on GitHub, and add `github.com` to
+`/home/git/.ssh/known_hosts` (`ssh-keyscan github.com >>
+/home/git/.ssh/known_hosts`). Then declare
+`url: git@github.com:user/repo.git` in `repository.yaml`.
 
 ## 5. Summary table
 
 | # | Decision | Status |
 |---|----------|--------|
-| D1 | Mirror destinations declared in root `repository.yaml` (`mirrors` list; opt-in) | Proposed |
-| D2 | Sync runs from the same `post-receive` hook via `mirror-sync.sh` | Proposed |
-| D3 | Push only the refs received (deletions included), not `--mirror` | Proposed |
-| D4 | Reuse central hook + template + installer (ADR-0002-D2); new repos pre-wired, legacy via installer | Proposed |
-| D5 | Async sync, per-mirror logs, never block the push | Proposed |
-| D6 | Mirror credentials server-side (SSH keys / credential helper), never in `repository.yaml` | Proposed |
+| D1 | Mirror destinations declared in root `repository.yaml` (`mirrors` list; opt-in) | Accepted |
+| D2 | Sync runs from the same `post-receive` hook via `mirror-sync.sh` | Accepted |
+| D3 | Push only the refs received (deletions included), not `--mirror` | Accepted |
+| D4 | Reuse central hook + template + installer (ADR-0002-D2); new repos pre-wired, legacy via installer | Accepted |
+| D5 | Async sync, per-mirror logs, never block the push | Accepted |
+| D6 | Mirror credentials server-side (SSH keys / credential helper), never in `repository.yaml` | Accepted |
 
 ---
 
-*Generated 2026-08-17. Decision record — implementation pending
-subsequent task.*
+*Implemented & verified E2E 2026-08-18. ADR-0002-D1 dispatcher
+extended with mirror sync (D2); see section 4a for deployment gotchas.*
