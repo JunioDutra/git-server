@@ -60,3 +60,7 @@ root-owned and SSH push fails with "dubious ownership".
 
 Cloning an empty repo defaults local branch to `master` even though the server
 creates bare repos with `-b main`. Client must `git branch -m main` before push.
+
+## Repository
+
+add mirror configuration
