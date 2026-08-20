@@ -12,13 +12,18 @@ HTTP service to create bare git repositories on this server (LXC 109, Alpine).
 
 `GET /` — HTML index listing all repositories.
 
-`GET /repo/<name>/` — browse repo tree at HEAD (root).
+`GET /repo/<name>/` — browse the default repo branch (root).
 
 `GET /repo/<name>/tree/<path>` — browse a subdirectory.
 
 `GET /repo/<name>/blob/<path>` — view file content (plain, escaped).
 
 `GET /repo/<name>/log` — recent commits (plain list).
+
+Browse routes accept `?ref=<branch>`. Repository, file and log pages include a
+branch selector and preserve the selected branch in navigation links. If a bare
+repository has a dangling `HEAD`, the UI falls back to `main`, `master`, or the
+first available branch instead of incorrectly reporting that it is empty.
 
 If a `README.md` (or `README`, `README.txt`, etc.) exists in the repo root, it is
 rendered at the bottom of the repo page using `marked` + `DOMPurify` loaded from

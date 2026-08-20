@@ -22,7 +22,7 @@ import os
 import re
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 REPOS_ROOT = os.environ.get("GIT_REPOS_ROOT", "/home/git/repos")
 HOST = os.environ.get("GIT_HTTP_HOST", "0.0.0.0")
@@ -38,9 +38,9 @@ README_CANDIDATES = [
 ]
 
 
-def get_readme(repo):
+def get_readme(repo, ref):
     """Return (readme_path, raw_markdown) for the repo's README, or None."""
-    root = git(repo, "ls-tree", "HEAD")
+    root = git(repo, "ls-tree", ref)
     if root is None:
         return None
     names = []
@@ -55,7 +55,7 @@ def get_readme(repo):
             names.append(parts[1].strip())
     for candidate in README_CANDIDATES:
         if candidate in names:
-            content = git(repo, "show", f"HEAD:{candidate}")
+            content = git(repo, "show", f"{ref}:{candidate}")
             if content is not None:
                 return candidate, content
     return None
@@ -74,11 +74,17 @@ README_VIEWER_JS = """
   if (typeof DOMPurify !== 'undefined') {
     html = DOMPurify.sanitize(html, {ADD_ATTR: ['target']});
   }
-  var host = location.hostname;
+  var repoName = REPO_NAME_JS;
+  var branch = BRANCH_NAME_JS;
   html = html.replace(/href="([^"]+)"/g, function (m, href) {
     if (/^(https?:|mailto:|#)/i.test(href) || href.startsWith('//')) return m;
     if (href.startsWith('/')) return m;
-    return 'href="https://' + host + '/repo/' + REPO_NAME_JS + '/blob/' + href + '"';
+    var hashAt = href.indexOf('#');
+    var fragment = hashAt >= 0 ? href.slice(hashAt) : '';
+    var path = hashAt >= 0 ? href.slice(0, hashAt) : href;
+    var separator = path.indexOf('?') >= 0 ? '&' : '?';
+    return 'href="' + location.origin + '/repo/' + encodeURIComponent(repoName) +
+      '/blob/' + path + separator + 'ref=' + encodeURIComponent(branch) + fragment + '"';
   });
   document.getElementById('readme').innerHTML = html;
 })();
@@ -86,8 +92,20 @@ README_VIEWER_JS = """
 """
 
 
-def readme_viewer_html(repo_name):
-    return README_LIBS + README_VIEWER_JS.replace("REPO_NAME_JS", repo_name)
+def readme_viewer_html(repo_name, branch):
+    script = README_VIEWER_JS.replace("REPO_NAME_JS", js_json(repo_name))
+    script = script.replace("BRANCH_NAME_JS", js_json(branch))
+    return README_LIBS + script
+
+
+def js_json(value):
+    """Encode a string for a JavaScript literal inside an HTML script tag."""
+    return (json.dumps(value)
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029"))
 
 
 def js_str(value):
@@ -143,6 +161,8 @@ code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
 .create-msg.err{color:#cf222e}
 .btn-danger{padding:.35rem .8rem;background:#cf222e;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.8rem}
 .btn-danger:hover{background:#b51f2b}
+.repo-toolbar{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:.75rem 0 1rem}
+.repo-toolbar select{padding:.35rem .55rem;border:1px solid #d0d7de;border-radius:6px;background:#fff;font-size:.9rem}
 """
 
 
@@ -155,6 +175,59 @@ def git(repo_path, *args):
     if proc.returncode != 0:
         return None
     return proc.stdout
+
+
+def list_branches(repo):
+    """Return all local branch names from a bare repository."""
+    out = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/")
+    if out is None:
+        return []
+    return sorted(line.strip() for line in out.splitlines() if line.strip())
+
+
+def select_branch(repo, requested=None):
+    """Select an existing branch, falling back when the bare HEAD is dangling."""
+    branches = list_branches(repo)
+    if requested is not None:
+        return (requested if requested in branches else None), branches
+
+    head = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    head = head.strip() if head else None
+    if head in branches:
+        return head, branches
+    for candidate in ("main", "master"):
+        if candidate in branches:
+            return candidate, branches
+    return (branches[0] if branches else None), branches
+
+
+def with_branch(path, branch):
+    """Add the selected branch to an internal browse URL."""
+    return f"{path}?{urlencode({'ref': branch})}"
+
+
+def branch_selector(branches, selected):
+    """Render a branch picker which keeps the visitor on the current route."""
+    options = "".join(
+        f'<option value="{html.escape(branch, quote=True)}"'
+        f'{" selected" if branch == selected else ""}>{html.escape(branch)}</option>'
+        for branch in branches
+    )
+    return f"""<div class="repo-toolbar">
+<label for="branch-select"><strong>Branch:</strong></label>
+<select id="branch-select">{options}</select>
+</div>
+<script>
+(function () {{
+  var picker = document.getElementById('branch-select');
+  if (!picker) return;
+  picker.addEventListener('change', function () {{
+    var target = new URL(window.location.href);
+    target.searchParams.set('ref', picker.value);
+    window.location.href = target.toString();
+  }});
+}})();
+</script>"""
 
 
 def list_repos():
@@ -286,17 +359,16 @@ def index_page():
     return page("Git Server", body)
 
 
-def repo_page(name, repo, sub):
+def repo_page(name, repo, sub, branch, branches):
     """Browse a directory (tree) inside the repo."""
+    ref = f"refs/heads/{branch}"
     if sub:
-        tree_ref = f"HEAD:{sub}"
+        tree_ref = f"{ref}:{sub}"
     else:
-        tree_ref = "HEAD"
+        tree_ref = ref
     listing = git(repo, "ls-tree", tree_ref)
     if listing is None:
-        # Maybe HEAD doesn't exist yet (empty repo)
-        head = git(repo, "rev-parse", "--verify", "HEAD")
-        if head is None:
+        if not branches:
             body = f"""<h1>{html.escape(name)}</h1>
 <p class="muted">Empty repository — no commits yet.</p>
 <p><button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
@@ -316,26 +388,29 @@ def repo_page(name, repo, sub):
         mode, otype, oid = meta_parts[0], meta_parts[1], meta_parts[2]
         entry_name = entry.strip()
         if otype == "tree":
-            href = f"/repo/{name}/tree/{sub + '/' if sub else ''}{entry_name}"
+            href = with_branch(f"/repo/{name}/tree/{sub + '/' if sub else ''}{entry_name}", branch)
             rows.append(f'<tr><td class="dir"><a href="{html.escape(href)}">{html.escape(entry_name)}/</a></td><td class="muted">dir</td></tr>')
         else:
-            href = f"/repo/{name}/blob/{sub + '/' if sub else ''}{entry_name}"
+            href = with_branch(f"/repo/{name}/blob/{sub + '/' if sub else ''}{entry_name}", branch)
             rows.append(f'<tr><td><a href="{html.escape(href)}">{html.escape(entry_name)}</a></td><td class="muted">{html.escape(otype)}</td></tr>')
 
-    crumbs = [f'<a href="/repo/{html.escape(name)}/">{html.escape(name)}</a>']
+    root_href = with_branch(f"/repo/{name}/", branch)
+    crumbs = [f'<a href="{html.escape(root_href)}">{html.escape(name)}</a>']
     acc = ""
     for part in sub.split("/"):
         acc = f"{acc}/{part}" if acc else part
-        crumbs.append(f'<a href="/repo/{html.escape(name)}/tree/{html.escape(acc)}">{html.escape(part)}</a>')
+        crumb_href = with_branch(f"/repo/{name}/tree/{acc}", branch)
+        crumbs.append(f'<a href="{html.escape(crumb_href)}">{html.escape(part)}</a>')
     breadcrumb = " / ".join(crumbs)
 
     body = f"""<h1>{html.escape(name)}</h1>
 <div class="breadcrumb">📁 {breadcrumb}</div>
-<p><a href="/repo/{html.escape(name)}/log">commit log</a> · <a href="/">all repos</a>
+{branch_selector(branches, branch)}
+<p><a href="{html.escape(with_branch(f'/repo/{name}/log', branch))}">commit log</a> · <a href="/">all repos</a>
  · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <table><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
 
-    readme = get_readme(repo)
+    readme = get_readme(repo, ref)
     if readme:
         readme_path, readme_content = readme
         body += f"""
@@ -344,13 +419,14 @@ def repo_page(name, repo, sub):
 <pre id="readme-raw" hidden>{html.escape(readme_content)}</pre>
 <div id="readme"><p class="muted">Loading README…</p></div>
 </div>
-{readme_viewer_html(name)}"""
+{readme_viewer_html(name, branch)}"""
 
     return page(f"{name} — Git Server", body + JS_DELETE_REPO)
 
 
-def blob_page(name, repo, sub):
-    content = git(repo, "show", f"HEAD:{sub}")
+def blob_page(name, repo, sub, branch, branches):
+    ref = f"refs/heads/{branch}"
+    content = git(repo, "show", f"{ref}:{sub}")
     if content is None:
         return None
     ext = os.path.splitext(sub)[1].lower()
@@ -362,14 +438,16 @@ def blob_page(name, repo, sub):
     }.get(ext, "")
     label = f'<span class="muted"> ({lang})</span>' if lang else ""
     body = f"""<h1>{html.escape(name)} / {html.escape(sub)}</h1>
-<div class="breadcrumb"><a href="/repo/{html.escape(name)}/">← {html.escape(name)}</a> · <a href="/">all repos</a></div>
+<div class="breadcrumb"><a href="{html.escape(with_branch(f'/repo/{name}/', branch))}">← {html.escape(name)}</a> · <a href="/">all repos</a></div>
+{branch_selector(branches, branch)}
 <p class="muted">size: {len(content)} bytes{label}</p>
 <pre>{html.escape(content)}</pre>"""
     return page(f"{sub} — {name}", body)
 
 
-def log_page(name, repo):
-    out = git(repo, "log", "--oneline", "-n", "50")
+def log_page(name, repo, branch, branches):
+    ref = f"refs/heads/{branch}"
+    out = git(repo, "log", "--oneline", "-n", "50", ref)
     if out is None:
         return None
     items = "".join(
@@ -378,7 +456,8 @@ def log_page(name, repo):
         for line in out.splitlines() if line.strip()
     ) or '<tr><td colspan="2" class="muted">No commits.</td></tr>'
     body = f"""<h1>{html.escape(name)} — commit log</h1>
-<p><a href="/repo/{html.escape(name)}/">← files</a> · <a href="/">all repos</a></p>
+<p><a href="{html.escape(with_branch(f'/repo/{name}/', branch))}">← files</a> · <a href="/">all repos</a></p>
+{branch_selector(branches, branch)}
 <table><thead><tr><th>Commit</th><th>Message</th></tr></thead><tbody>{items}</tbody></table>"""
     return page(f"{name} — log", body)
 
@@ -447,6 +526,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        requested_branch = (parse_qs(parsed.query).get("ref") or [None])[0]
 
         if path == "/":
             self._send(200, index_page())
@@ -461,11 +541,15 @@ class Handler(BaseHTTPRequestHandler):
             if repo is None:
                 self._send(404, page("Not found", "<h1>404</h1><p>Unknown repository.</p><p><a href='/'>← back</a></p>"))
                 return
+            branch, branches = select_branch(repo, requested_branch)
+            if requested_branch is not None and branch is None:
+                self._send(404, page("Branch not found", "<h1>404</h1><p>Unknown branch.</p>"))
+                return
             if rest == "" or rest == "tree":
-                self._send(200, repo_page(name, repo, ""))
+                self._send(200, repo_page(name, repo, "", branch or "", branches))
                 return
             if rest == "log":
-                out = log_page(name, repo)
+                out = log_page(name, repo, branch, branches) if branch else None
                 self._send(200 if out else 404, out or page("Error", "<p>Cannot read log.</p>"))
                 return
             if rest.startswith("tree/"):
@@ -473,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                 if sub is None:
                     self._send(400, page("Bad path", "<p>Invalid path.</p>"))
                     return
-                out = repo_page(name, repo, sub)
+                out = repo_page(name, repo, sub, branch, branches) if branch else None
                 self._send(200 if out else 404, out or page("Not found", "<p>Path not found.</p>"))
                 return
             if rest.startswith("blob/"):
@@ -481,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                 if sub is None:
                     self._send(400, page("Bad path", "<p>Invalid path.</p>"))
                     return
-                out = blob_page(name, repo, sub)
+                out = blob_page(name, repo, sub, branch, branches) if branch else None
                 self._send(200 if out else 404, out or page("Not found", "<p>File not found.</p>"))
                 return
             self._send(404, page("Not found", "<p>Unknown route.</p>"))
