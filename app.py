@@ -36,6 +36,8 @@ README_CANDIDATES = [
     "README.md", "readme.md", "README.MD",
     "Readme.md", "README.markdown", "README.txt", "README",
 ]
+MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+GIT_SSH_HOST = "git-server"
 
 
 def get_readme(repo, ref):
@@ -65,15 +67,34 @@ README_LIBS = """<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 """
 
-README_VIEWER_JS = """
+MARKDOWN_VIEWER_JS = """
 <script>
 (function () {
-  var raw = document.getElementById('readme-raw');
-  if (!raw || typeof marked === 'undefined') return;
-  var html = marked.parse(raw.textContent);
-  if (typeof DOMPurify !== 'undefined') {
-    html = DOMPurify.sanitize(html, {ADD_ATTR: ['target']});
+  var raw = document.getElementById(RAW_ID_JS);
+  var rendered = document.getElementById(RENDERED_ID_JS);
+  var toggle = TOGGLE_ID_JS ? document.getElementById(TOGGLE_ID_JS) : null;
+  if (!raw || !rendered) return;
+
+  function showRaw() {
+    raw.hidden = false;
+    rendered.hidden = true;
+    if (toggle) toggle.textContent = 'Ver renderizado';
   }
+
+  function showRendered() {
+    raw.hidden = true;
+    rendered.hidden = false;
+    if (toggle) toggle.textContent = 'Ver raw';
+  }
+
+  if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+    showRaw();
+    if (toggle) toggle.disabled = true;
+    return;
+  }
+
+  var html = marked.parse(raw.textContent);
+  html = DOMPurify.sanitize(html, {ADD_ATTR: ['target']});
   var repoName = REPO_NAME_JS;
   var branch = BRANCH_NAME_JS;
   html = html.replace(/href="([^"]+)"/g, function (m, href) {
@@ -86,15 +107,26 @@ README_VIEWER_JS = """
     return 'href="' + location.origin + '/repo/' + encodeURIComponent(repoName) +
       '/blob/' + path + separator + 'ref=' + encodeURIComponent(branch) + fragment + '"';
   });
-  document.getElementById('readme').innerHTML = html;
+  rendered.innerHTML = html;
+  showRendered();
+  if (toggle) {
+    toggle.addEventListener('click', function () {
+      if (raw.hidden) showRaw();
+      else showRendered();
+    });
+  }
 })();
 </script>
 """
 
 
-def readme_viewer_html(repo_name, branch):
-    script = README_VIEWER_JS.replace("REPO_NAME_JS", js_json(repo_name))
+def markdown_viewer_html(repo_name, branch, raw_id, rendered_id, toggle_id=None):
+    """Render Markdown safely, falling back to raw text if CDN libraries fail."""
+    script = MARKDOWN_VIEWER_JS.replace("REPO_NAME_JS", js_json(repo_name))
     script = script.replace("BRANCH_NAME_JS", js_json(branch))
+    script = script.replace("RAW_ID_JS", js_json(raw_id))
+    script = script.replace("RENDERED_ID_JS", js_json(rendered_id))
+    script = script.replace("TOGGLE_ID_JS", js_json(toggle_id) if toggle_id else "null")
     return README_LIBS + script
 
 
@@ -124,6 +156,35 @@ function deleteRepo(name) {
       else { alert('Error: ' + (res.d.error || 'failed')); }
     })
     .catch(function () { alert('Network error'); });
+}
+</script>
+"""
+
+JS_COPY_COMMAND = """
+<script>
+function copyCommand(button) {
+  var command = button.getAttribute('data-command');
+  var original = button.textContent;
+  function copied() {
+    button.textContent = 'Copiado';
+    setTimeout(function () { button.textContent = original; }, 1400);
+  }
+  function fallback() {
+    var area = document.createElement('textarea');
+    area.value = command;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try { if (document.execCommand('copy')) copied(); }
+    finally { document.body.removeChild(area); }
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(command).then(copied).catch(fallback);
+  } else {
+    fallback();
+  }
 }
 </script>
 """
@@ -163,6 +224,18 @@ code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
 .btn-danger:hover{background:#b51f2b}
 .repo-toolbar{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:.75rem 0 1rem}
 .repo-toolbar select{padding:.35rem .55rem;border:1px solid #d0d7de;border-radius:6px;background:#fff;font-size:.9rem}
+.repo-access{background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:1rem;margin:1rem 0}
+.repo-access h2{font-size:1rem;margin:0 0 .6rem}
+.repo-command{display:flex;align-items:center;gap:.5rem;margin:.45rem 0;flex-wrap:wrap}
+.repo-command code{flex:1;min-width:0;overflow-wrap:anywhere}
+.btn-copy,.btn-toggle{padding:.35rem .8rem;background:#0969da;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.8rem}
+.btn-copy:hover,.btn-toggle:hover{background:#0757b8}.btn-toggle:disabled{background:#8c959f;cursor:not-allowed}
+.markdown-rendered{line-height:1.6}.markdown-rendered img{max-width:100%}
+.markdown-rendered h1,.markdown-rendered h2,.markdown-rendered h3,.markdown-rendered h4{border-bottom:1px solid #d0d7de;padding-bottom:.3rem;margin-top:1.2rem}
+.markdown-rendered pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:1rem;overflow-x:auto;font-size:.85rem}
+.markdown-rendered code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
+.markdown-rendered table{border-collapse:collapse;margin:.5rem 0}.markdown-rendered th,.markdown-rendered td{border:1px solid #d0d7de;padding:.3rem .6rem;text-align:left}
+.markdown-rendered blockquote{border-left:3px solid #d0d7de;margin:.5rem 0;padding:.1rem 1rem;color:#57606a}
 """
 
 
@@ -228,6 +301,27 @@ def branch_selector(branches, selected):
   }});
 }})();
 </script>"""
+
+
+def repo_access_panel(name):
+    """Render copyable SSH commands for cloning or adding this repository."""
+    repo_url = f"git@{GIT_SSH_HOST}:repos/{name}.git"
+    commands = (
+        ("Clone", f"git clone {repo_url}"),
+        ("Adicionar como origin", f"git remote add origin {repo_url}"),
+    )
+    rows = "".join(
+        f'<div class="repo-command"><span class="muted">{html.escape(label)}</span>'
+        f'<code>{html.escape(command)}</code>'
+        f'<button class="btn-copy" type="button" data-command="{html.escape(command, quote=True)}" '
+        f'onclick="copyCommand(this)">Copiar</button></div>'
+        for label, command in commands
+    )
+    return f"""<div class="repo-access">
+<h2>Acesso via SSH</h2>
+{rows}
+</div>
+{JS_COPY_COMMAND}"""
 
 
 def list_repos():
@@ -370,6 +464,7 @@ def repo_page(name, repo, sub, branch, branches):
     if listing is None:
         if not branches:
             body = f"""<h1>{html.escape(name)}</h1>
+{repo_access_panel(name)}
 <p class="muted">Empty repository — no commits yet.</p>
 <p><button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <p><a href="/">← back</a></p>"""
@@ -403,23 +498,25 @@ def repo_page(name, repo, sub, branch, branches):
         crumbs.append(f'<a href="{html.escape(crumb_href)}">{html.escape(part)}</a>')
     breadcrumb = " / ".join(crumbs)
 
+    access_panel = repo_access_panel(name) if not sub else ""
     body = f"""<h1>{html.escape(name)}</h1>
+{access_panel}
 <div class="breadcrumb">📁 {breadcrumb}</div>
 {branch_selector(branches, branch)}
 <p><a href="{html.escape(with_branch(f'/repo/{name}/log', branch))}">commit log</a> · <a href="/">all repos</a>
  · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <table><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
 
-    readme = get_readme(repo, ref)
+    readme = get_readme(repo, ref) if not sub else None
     if readme:
         readme_path, readme_content = readme
         body += f"""
 <div id="readme-wrapper">
 <h2>README <span class="muted">({html.escape(readme_path)})</span></h2>
 <pre id="readme-raw" hidden>{html.escape(readme_content)}</pre>
-<div id="readme"><p class="muted">Loading README…</p></div>
+<div id="readme" class="markdown-rendered"><p class="muted">Loading README…</p></div>
 </div>
-{readme_viewer_html(name, branch)}"""
+{markdown_viewer_html(name, branch, 'readme-raw', 'readme')}"""
 
     return page(f"{name} — Git Server", body + JS_DELETE_REPO)
 
@@ -434,10 +531,21 @@ def blob_page(name, repo, sub, branch, branches):
         ".py": "python", ".js": "javascript", ".ts": "typescript",
         ".go": "go", ".java": "java", ".sh": "bash", ".yml": "yaml",
         ".yaml": "yaml", ".json": "json", ".md": "markdown",
+        ".markdown": "markdown",
         ".html": "html", ".css": "css", ".sql": "sql", ".xml": "xml",
     }.get(ext, "")
     label = f'<span class="muted"> ({lang})</span>' if lang else ""
-    body = f"""<h1>{html.escape(name)} / {html.escape(sub)}</h1>
+    if ext in MARKDOWN_EXTENSIONS:
+        body = f"""<h1>{html.escape(name)} / {html.escape(sub)}</h1>
+<div class="breadcrumb"><a href="{html.escape(with_branch(f'/repo/{name}/', branch))}">← {html.escape(name)}</a> · <a href="/">all repos</a></div>
+{branch_selector(branches, branch)}
+<p class="muted">size: {len(content)} bytes{label}</p>
+<p><button id="markdown-toggle" class="btn-toggle" type="button">Ver raw</button></p>
+<pre id="markdown-raw" hidden>{html.escape(content)}</pre>
+<div id="markdown-rendered" class="markdown-rendered"><p class="muted">Loading Markdown…</p></div>
+{markdown_viewer_html(name, branch, 'markdown-raw', 'markdown-rendered', 'markdown-toggle')}"""
+    else:
+        body = f"""<h1>{html.escape(name)} / {html.escape(sub)}</h1>
 <div class="breadcrumb"><a href="{html.escape(with_branch(f'/repo/{name}/', branch))}">← {html.escape(name)}</a> · <a href="/">all repos</a></div>
 {branch_selector(branches, branch)}
 <p class="muted">size: {len(content)} bytes{label}</p>
