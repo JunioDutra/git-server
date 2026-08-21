@@ -14,7 +14,7 @@
 #   - Pushes only the refs the hook received (deletions propagate as
 #     --delete), never a full --mirror push (D3).
 #   - Runs asynchronously (background) so the source push never blocks (D5).
-#   - Logs per mirror to /home/git/logs/mirrors/<repo>.log (D5).
+#   - Writes its log to stdout/stderr; post-receive captures it per execution.
 #   - One failing mirror never stops the others (D5).
 #
 # Deps: git, awk, tar, timeout (busybox)
@@ -31,15 +31,14 @@ REPO_BARE="$1"
 REPO_NAME="$2"
 shift 2
 
-LOG_DIR="/home/git/logs/mirrors"
 WORK=""
 
 log() { printf '%s\n' "$*"; }
 
 fail() {
-  echo "==== MIRROR FAILED ($(date -Is)) ====" >> "$LOG_DIR/$REPO_NAME.log"
-  echo "exit=$1 reason=$2" >> "$LOG_DIR/$REPO_NAME.log"
-  echo "==== END FAILED ====" >> "$LOG_DIR/$REPO_NAME.log"
+  echo "==== MIRROR FAILED ($(date -Is)) ====" >&2
+  echo "exit=$1 reason=$2" >&2
+  echo "==== END FAILED ====" >&2
   exit "$1"
 }
 
@@ -48,9 +47,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$LOG_DIR" || true
-
-echo "==== MIRROR START ($(date -Is)) repo=$REPO_NAME ====" >> "$LOG_DIR/$REPO_NAME.log"
+echo "==== MIRROR START ($(date -Is)) repo=$REPO_NAME ===="
 
 # Pick a SHA to materialize the pushed tree: the last non-deletion newrev.
 SHA=""
@@ -66,7 +63,7 @@ if [ -z "$SHA" ]; then
   SHA=$(git --git-dir="$REPO_BARE" rev-parse HEAD 2>/dev/null || true)
 fi
 if [ -z "$SHA" ]; then
-  echo "skip: no refs and no HEAD" >> "$LOG_DIR/$REPO_NAME.log"
+  echo "skip: no refs and no HEAD"
   exit 0
 fi
 
@@ -77,7 +74,7 @@ git --git-dir="$REPO_BARE" archive "$SHA" | tar -x -C "$WORK" || fail 3 "git arc
 # Read repository.yaml
 CFG="$WORK/repository.yaml"
 if [ ! -f "$CFG" ]; then
-  echo "skip: no repository.yaml (opt-in not set)" >> "$LOG_DIR/$REPO_NAME.log"
+  echo "skip: no repository.yaml (opt-in not set)"
   exit 0
 fi
 
@@ -108,24 +105,26 @@ MIRRORS=$(awk '
 ' "$CFG")
 
 if [ -z "$MIRRORS" ]; then
-  echo "skip: repository.yaml has no 'mirrors' key" >> "$LOG_DIR/$REPO_NAME.log"
+  echo "skip: repository.yaml has no 'mirrors' key"
   exit 0
 fi
 
-# Push to each mirror independently
-printf '%s\n' "$MIRRORS" | while IFS="$(printf '\t')" read -r url branches; do
+# Push to each mirror independently. Do not use a pipeline so failures survive
+# the loop and become the asynchronous task's exit status.
+MIRROR_STATUS=0
+while IFS="$(printf '\t')" read -r url branches; do
   [ -z "$url" ] && continue
 
   # Validate URL (ADR-0003-D1): ssh/https/git@ only, no local paths
   case "$url" in
     ssh://*|git@*|http://*|https://*) ;;
     *)
-      echo "skip: invalid mirror URL: $url" >> "$LOG_DIR/$REPO_NAME.log"
+      echo "skip: invalid mirror URL: $url" >&2
       continue
       ;;
   esac
 
-  echo "mirror: $url branches=${branches:-all}" >> "$LOG_DIR/$REPO_NAME.log"
+  echo "mirror: $url branches=${branches:-all}"
   err=0
 
   for pair in "$@"; do
@@ -149,12 +148,12 @@ printf '%s\n' "$MIRRORS" | while IFS="$(printf '\t')" read -r url branches; do
 
     case "$new" in
       0000000000000000000000000000000000000000)
-        if ! timeout 60 git push "$url" --delete "$ref" >> "$LOG_DIR/$REPO_NAME.log" 2>&1; then
+        if ! timeout 60 git push "$url" --delete "$ref"; then
           err=1
         fi
         ;;
       *)
-        if ! timeout 60 git push "$url" "$new:$ref" >> "$LOG_DIR/$REPO_NAME.log" 2>&1; then
+        if ! timeout 60 git push "$url" "$new:$ref"; then
           err=1
         fi
         ;;
@@ -162,12 +161,15 @@ printf '%s\n' "$MIRRORS" | while IFS="$(printf '\t')" read -r url branches; do
   done
 
   if [ "$err" -eq 0 ]; then
-    echo "mirror OK: $url" >> "$LOG_DIR/$REPO_NAME.log"
+    echo "mirror OK: $url"
   else
-    echo "==== MIRROR FAILED ($(date -Is)) mirror=$url ====" >> "$LOG_DIR/$REPO_NAME.log"
-    echo "==== END FAILED ====" >> "$LOG_DIR/$REPO_NAME.log"
+    echo "==== MIRROR FAILED ($(date -Is)) mirror=$url ====" >&2
+    echo "==== END FAILED ====" >&2
+    MIRROR_STATUS=1
   fi
-done
+done <<EOF
+$MIRRORS
+EOF
 
-echo "==== MIRROR END ($(date -Is)) ====" >> "$LOG_DIR/$REPO_NAME.log"
-exit 0
+echo "==== MIRROR END ($(date -Is)) ===="
+exit "$MIRROR_STATUS"

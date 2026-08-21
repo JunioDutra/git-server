@@ -20,15 +20,22 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 REPOS_ROOT = os.environ.get("GIT_REPOS_ROOT", "/home/git/repos")
+HOOK_LOGS_ROOT = os.environ.get("GIT_HOOK_LOGS_ROOT", "/home/git/logs/hooks")
+HOOK_LOG_RETENTION_DAYS = int(os.environ.get("GIT_HOOK_LOG_RETENTION_DAYS", "30"))
+HOOKS_ROOT = os.environ.get("GIT_HOOKS_ROOT", "/home/git/hooks")
 HOST = os.environ.get("GIT_HTTP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GIT_HTTP_PORT", "8080"))
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+LOG_ID_RE = re.compile(r"^[A-Za-z0-9._-]+\.log$")
 # Safe path chars for browsing; reject anything that could escape or inject.
 SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/ -]+$")
 # README candidates, in priority order
@@ -160,6 +167,25 @@ function deleteRepo(name) {
 </script>
 """
 
+JS_DELETE_HOOK_LOGS = """
+<script>
+function deleteHookLog(name, logId) {
+  if (!confirm('Delete this hook log?\\nThis cannot be undone.')) return;
+  fetch('/repo/' + encodeURIComponent(name) + '/hook-logs/' + encodeURIComponent(logId), {method: 'DELETE'})
+    .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
+    .then(function (res) { if (res.ok) location.reload(); else alert('Error: ' + (res.d.error || 'failed')); })
+    .catch(function () { alert('Network error'); });
+}
+function clearHookLogs(name) {
+  if (!confirm('Delete all hook logs for "' + name + '"?\\nThis cannot be undone.')) return;
+  fetch('/repo/' + encodeURIComponent(name) + '/hook-logs', {method: 'DELETE'})
+    .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
+    .then(function (res) { if (res.ok) location.reload(); else alert('Error: ' + (res.d.error || 'failed')); })
+    .catch(function () { alert('Network error'); });
+}
+</script>
+"""
+
 JS_COPY_COMMAND = """
 <script>
 function copyCommand(button) {
@@ -222,6 +248,8 @@ code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
 .create-msg.err{color:#cf222e}
 .btn-danger{padding:.35rem .8rem;background:#cf222e;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.8rem}
 .btn-danger:hover{background:#b51f2b}
+.btn-secondary{padding:.35rem .8rem;background:#57606a;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.8rem}
+.btn-secondary:hover{background:#424a53}.status-ok{color:#1a7f37}.status-failed{color:#cf222e}.status-open{color:#9a6700}
 .repo-toolbar{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:.75rem 0 1rem}
 .repo-toolbar select{padding:.35rem .55rem;border:1px solid #d0d7de;border-radius:6px;background:#fff;font-size:.9rem}
 .repo-access{background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:1rem;margin:1rem 0}
@@ -370,6 +398,13 @@ def create_bare_repo(name):
     )
     if proc.returncode != 0:
         return False, proc.stderr.strip() or "git init failed"
+    canonical_hook = os.path.join(HOOKS_ROOT, "post-receive")
+    if os.path.isfile(canonical_hook):
+        try:
+            os.symlink(canonical_hook, os.path.join(path, "hooks", "post-receive"))
+        except OSError as exc:
+            shutil.rmtree(path)
+            return False, f"hook install failed: {exc}"
     return True, path
 
 
@@ -382,9 +417,152 @@ def delete_bare_repo(name):
     path = os.path.join(REPOS_ROOT, f"{name}.git")
     if not os.path.isdir(path):
         return False, f"repo not found: {name}"
-    import shutil
     shutil.rmtree(path)
+    delete_hook_logs(name)
     return True, path
+
+
+def hook_log_dir(name):
+    """Return the dedicated hook-log directory for a validated repo name."""
+    return os.path.join(HOOK_LOGS_ROOT, name)
+
+
+def legacy_hook_log_paths(name):
+    return {
+        "legacy-build.log": os.path.join("/home/git/logs/builds", f"{name}.log"),
+        "legacy-mirror.log": os.path.join("/home/git/logs/mirrors", f"{name}.log"),
+    }
+
+
+def cleanup_hook_logs(name=None):
+    """Delete expired per-execution logs. Legacy aggregate logs are retained."""
+    if HOOK_LOG_RETENTION_DAYS < 0:
+        return
+    cutoff = time.time() - HOOK_LOG_RETENTION_DAYS * 86400
+    dirs = [hook_log_dir(name)] if name else []
+    if not name and os.path.isdir(HOOK_LOGS_ROOT):
+        dirs = [os.path.join(HOOK_LOGS_ROOT, entry) for entry in os.listdir(HOOK_LOGS_ROOT)
+                if NAME_RE.match(entry)]
+    for directory in dirs:
+        if not os.path.isdir(directory):
+            continue
+        for entry in os.listdir(directory):
+            if not LOG_ID_RE.match(entry):
+                continue
+            path = os.path.join(directory, entry)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except FileNotFoundError:
+                pass
+        try:
+            if not os.listdir(directory):
+                os.rmdir(directory)
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def hook_log_path(name, log_id):
+    """Resolve a log ID to an existing regular file contained in its log root."""
+    if log_id in legacy_hook_log_paths(name):
+        path = legacy_hook_log_paths(name)[log_id]
+        return (path, True) if os.path.isfile(path) else (None, False)
+    if not LOG_ID_RE.match(log_id):
+        return None, False
+    directory = os.path.realpath(hook_log_dir(name))
+    path = os.path.realpath(os.path.join(directory, log_id))
+    if os.path.commonpath((directory, path)) != directory or not os.path.isfile(path):
+        return None, False
+    return path, False
+
+
+def parse_hook_log(path, log_id, legacy=False):
+    """Build safe display metadata from a log header and filesystem metadata."""
+    try:
+        stat = os.stat(path)
+        with open(path, "rb") as fh:
+            header = fh.read(16384).decode("utf-8", "replace")
+            if stat.st_size > 4096:
+                fh.seek(-4096, os.SEEK_END)
+            else:
+                fh.seek(0)
+            footer = fh.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return None
+    meta = {"id": log_id, "path": path, "legacy": legacy, "size": stat.st_size,
+            "mtime": stat.st_mtime, "type": "legacy", "started_at": "", "detail": ""}
+    if legacy:
+        meta["type"] = "build (legacy)" if log_id == "legacy-build.log" else "mirror (legacy)"
+        meta["status"] = "legacy"
+        return meta
+    for line in header.splitlines():
+        if not line.startswith("# hook-log: "):
+            continue
+        payload = line[len("# hook-log: "):]
+        if "=" in payload:
+            key, value = payload.split("=", 1)
+            meta[key] = value
+    meta["type"] = meta.get("type", "unknown")
+    meta["started_at"] = meta.get("started_at", "")
+    meta["detail"] = meta.get("branch", meta.get("refs", ""))
+    exit_match = re.search(r"# hook-log: exit=([-0-9]+)", footer)
+    if exit_match:
+        meta["status"] = "ok" if exit_match.group(1) == "0" else "failed"
+    else:
+        meta["status"] = "open"
+    return meta
+
+
+def list_hook_logs(name):
+    cleanup_hook_logs(name)
+    records = []
+    directory = hook_log_dir(name)
+    if os.path.isdir(directory):
+        for entry in os.listdir(directory):
+            if not LOG_ID_RE.match(entry):
+                continue
+            path, legacy = hook_log_path(name, entry)
+            if path:
+                record = parse_hook_log(path, entry, legacy)
+                if record:
+                    records.append(record)
+    for log_id, path in legacy_hook_log_paths(name).items():
+        if os.path.isfile(path):
+            record = parse_hook_log(path, log_id, True)
+            if record:
+                records.append(record)
+    return sorted(records, key=lambda record: record["mtime"], reverse=True)
+
+
+def delete_hook_logs(name, log_id=None):
+    """Delete one log or all logs for a repo, including legacy aggregate files."""
+    if log_id is not None:
+        path, _legacy = hook_log_path(name, log_id)
+        if not path:
+            return False, "log not found"
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            return False, "log not found"
+        return True, path
+    directory = hook_log_dir(name)
+    if os.path.isdir(directory):
+        shutil.rmtree(directory)
+    for path in legacy_hook_log_paths(name).values():
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    return True, directory
+
+
+def read_log_tail(path, limit=1024 * 1024):
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        if size > limit:
+            fh.seek(-limit, os.SEEK_END)
+            return fh.read().decode("utf-8", "replace"), True
+        return fh.read().decode("utf-8", "replace"), False
 
 
 def page(title, body):
@@ -466,7 +644,7 @@ def repo_page(name, repo, sub, branch, branches):
             body = f"""<h1>{html.escape(name)}</h1>
 {repo_access_panel(name)}
 <p class="muted">Empty repository — no commits yet.</p>
-<p><button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
+<p><a href="/repo/{html.escape(name)}/hook-logs">hook logs</a> · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <p><a href="/">← back</a></p>"""
             return page(f"{name} — Git Server", body + JS_DELETE_REPO)
         return None
@@ -503,7 +681,7 @@ def repo_page(name, repo, sub, branch, branches):
 {access_panel}
 <div class="breadcrumb">📁 {breadcrumb}</div>
 {branch_selector(branches, branch)}
-<p><a href="{html.escape(with_branch(f'/repo/{name}/log', branch))}">commit log</a> · <a href="/">all repos</a>
+<p><a href="{html.escape(with_branch(f'/repo/{name}/log', branch))}">commit log</a> · <a href="/repo/{html.escape(name)}/hook-logs">hook logs</a> · <a href="/">all repos</a>
  · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <table><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
 
@@ -570,6 +748,47 @@ def log_page(name, repo, branch, branches):
     return page(f"{name} — log", body)
 
 
+def hook_logs_page(name):
+    records = list_hook_logs(name)
+    rows = []
+    for record in records:
+        status = record["status"]
+        status_label = {"ok": "completed", "failed": "failed", "open": "running/incomplete",
+                        "legacy": "legacy"}.get(status, status)
+        status_class = {"ok": "status-ok", "failed": "status-failed", "open": "status-open"}.get(status, "muted")
+        detail = record.get("detail") or "—"
+        started = record.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record["mtime"]))
+        href = f"/repo/{name}/hook-logs/{record['id']}"
+        rows.append(
+            f'<tr><td><a href="{html.escape(href, quote=True)}">{html.escape(started)}</a></td>'
+            f'<td>{html.escape(record["type"])}</td><td><code>{html.escape(detail)}</code></td>'
+            f'<td>{record["size"]:,} bytes</td><td class="{status_class}">{status_label}</td>'
+            f'<td><button class="btn-danger" onclick="deleteHookLog(\'{js_str(name)}\', \'{js_str(record["id"])}\')">Delete</button></td></tr>'
+        )
+    content = "".join(rows) or '<tr><td colspan="6" class="muted">No hook logs yet.</td></tr>'
+    body = f"""<h1>{html.escape(name)} — hook logs</h1>
+<p><a href="/repo/{html.escape(name)}/">← files</a> · <a href="/">all repos</a></p>
+<p><button class="btn-danger" onclick="clearHookLogs('{js_str(name)}')">Delete all logs</button></p>
+<table><thead><tr><th>Started</th><th>Type</th><th>Branch / refs</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{content}</tbody></table>"""
+    return page(f"{name} — hook logs", body + JS_DELETE_HOOK_LOGS)
+
+
+def hook_log_detail_page(name, log_id):
+    path, _legacy = hook_log_path(name, log_id)
+    if not path:
+        return None
+    try:
+        content, truncated = read_log_tail(path)
+    except FileNotFoundError:
+        return None
+    notice = '<p class="muted">Showing the last 1 MiB. Download the raw file for the complete log.</p>' if truncated else ""
+    raw_href = f"/repo/{name}/hook-logs/{log_id}/raw"
+    body = f"""<h1>{html.escape(name)} — hook log</h1>
+<p><a href="/repo/{html.escape(name)}/hook-logs">← all hook logs</a> · <a href="{html.escape(raw_href, quote=True)}">download raw</a></p>
+{notice}<pre>{html.escape(content)}</pre>"""
+    return page(f"{name} — hook log", body)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "GitServer/0.2"
 
@@ -586,6 +805,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, payload):
         self._send(status, json.dumps(payload), "application/json")
+
+    def _send_file(self, path, filename):
+        try:
+            size = os.path.getsize(path)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            with open(path, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile)
+        except FileNotFoundError:
+            self._send(404, page("Not found", "<p>Log not found.</p>"))
 
     def do_POST(self):
         if self.path.rstrip("/") != "/create":
@@ -620,8 +852,28 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith("/repo/"):
             self._send_json(404, {"ok": False, "error": "not found"})
             return
-        name = path[len("/repo/"):]
-        if "/" in name:
+        parts = path[len("/repo/"):].split("/")
+        name = parts[0]
+        if not name or not NAME_RE.match(name):
+            self._send_json(400, {"ok": False, "error": "invalid repo name"})
+            return
+        if len(parts) >= 2 and parts[1] == "hook-logs":
+            if repo_path(name) is None:
+                self._send_json(404, {"ok": False, "error": "repo not found"})
+                return
+            if len(parts) == 2:
+                ok, msg = delete_hook_logs(name)
+            elif len(parts) == 3:
+                ok, msg = delete_hook_logs(name, parts[2])
+            else:
+                self._send_json(404, {"ok": False, "error": "not found"})
+                return
+            if ok:
+                self._send_json(200, {"ok": True, "repo": name, "path": msg})
+            else:
+                self._send_json(404, {"ok": False, "error": msg})
+            return
+        if len(parts) != 1:
             self._send_json(400, {"ok": False, "error": "invalid repo name"})
             return
         ok, msg = delete_bare_repo(name)
@@ -648,6 +900,25 @@ class Handler(BaseHTTPRequestHandler):
             repo = repo_path(name)
             if repo is None:
                 self._send(404, page("Not found", "<h1>404</h1><p>Unknown repository.</p><p><a href='/'>← back</a></p>"))
+                return
+            if rest == "hook-logs":
+                self._send(200, hook_logs_page(name))
+                return
+            if rest.startswith("hook-logs/"):
+                log_rest = rest[len("hook-logs/"):]
+                if log_rest.endswith("/raw"):
+                    log_id = log_rest[:-len("/raw")]
+                    log_path, _legacy = hook_log_path(name, log_id)
+                    if not log_path:
+                        self._send(404, page("Not found", "<p>Log not found.</p>"))
+                    else:
+                        self._send_file(log_path, log_id)
+                    return
+                if "/" in log_rest:
+                    self._send(404, page("Not found", "<p>Unknown route.</p>"))
+                    return
+                out = hook_log_detail_page(name, log_rest)
+                self._send(200 if out else 404, out or page("Not found", "<p>Log not found.</p>"))
                 return
             branch, branches = select_branch(repo, requested_branch)
             if requested_branch is not None and branch is None:
@@ -683,6 +954,15 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(REPOS_ROOT, exist_ok=True)
+    os.makedirs(HOOK_LOGS_ROOT, exist_ok=True)
+    cleanup_hook_logs()
+
+    def maintain_hook_logs():
+        while True:
+            time.sleep(3600)
+            cleanup_hook_logs()
+
+    threading.Thread(target=maintain_hook_logs, daemon=True).start()
     print(f"git-server listening on {HOST}:{PORT} (repos root: {REPOS_ROOT})")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 

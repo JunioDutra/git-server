@@ -28,13 +28,71 @@ GIT_DIR_REPO="$(pwd)"          # bare repo dir (hooks run with cwd = repo)
 # Canonical scripts live next to this hook
 BUILD_SCRIPT="$HOOK_DIR/build-image.sh"
 MIRROR_SCRIPT="$HOOK_DIR/mirror-sync.sh"
-BUILD_LOGS="/home/git/logs/builds"
-MIRROR_LOGS="/home/git/logs/mirrors"
+HOOK_LOGS_ROOT="${GIT_HOOK_LOGS_ROOT:-/home/git/logs/hooks}"
+HOOK_LOG_RETENTION_DAYS="${GIT_HOOK_LOG_RETENTION_DAYS:-30}"
 
 # Resolve repo name from bare dir path (e.g. /home/git/repos/foo.git -> foo)
 REPO_NAME=$(basename "$GIT_DIR_REPO" .git)
 
-mkdir -p "$BUILD_LOGS" "$MIRROR_LOGS"
+REPO_LOG_DIR="$HOOK_LOGS_ROOT/$REPO_NAME"
+mkdir -p "$REPO_LOG_DIR"
+
+# Best-effort retention. The HTTP server also performs this cleanup hourly.
+case "$HOOK_LOG_RETENTION_DAYS" in
+  ''|*[!0-9]*) HOOK_LOG_RETENTION_DAYS=30 ;;
+esac
+find "$REPO_LOG_DIR" -type f -name '*.log' -mtime +"$HOOK_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+
+run_build_logged() {
+  branch=$1
+  sha=$2
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  tmp=$(mktemp "$REPO_LOG_DIR/${stamp}-build-XXXXXX") || return 1
+  log_file="$tmp.log"
+  mv "$tmp" "$log_file" || return 1
+  (
+    printf '%s\n' "# hook-log: type=build"
+    printf '%s\n' "# hook-log: repo=$REPO_NAME"
+    printf '%s\n' "# hook-log: started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "# hook-log: branch=$branch"
+    printf '%s\n' "# hook-log: sha=$sha"
+    printf '%s\n' "# hook-log: --- output ---"
+    if [ -x "$BUILD_SCRIPT" ]; then
+      "$BUILD_SCRIPT" "$GIT_DIR_REPO" "$branch" "$sha" "$REPO_NAME"
+      code=$?
+    else
+      echo "build script not found or not executable: $BUILD_SCRIPT" >&2
+      code=127
+    fi
+    printf '%s\n' "# hook-log: ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "# hook-log: exit=$code"
+    exit "$code"
+  ) > "$log_file" 2>&1 &
+}
+
+run_mirror_logged() {
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  tmp=$(mktemp "$REPO_LOG_DIR/${stamp}-mirror-XXXXXX") || return 1
+  log_file="$tmp.log"
+  mv "$tmp" "$log_file" || return 1
+  (
+    printf '%s\n' "# hook-log: type=mirror"
+    printf '%s\n' "# hook-log: repo=$REPO_NAME"
+    printf '%s\n' "# hook-log: started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "# hook-log: refs=$*"
+    printf '%s\n' "# hook-log: --- output ---"
+    if [ -x "$MIRROR_SCRIPT" ]; then
+      "$MIRROR_SCRIPT" "$GIT_DIR_REPO" "$REPO_NAME" "$@"
+      code=$?
+    else
+      echo "mirror script not found or not executable: $MIRROR_SCRIPT" >&2
+      code=127
+    fi
+    printf '%s\n' "# hook-log: ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "# hook-log: exit=$code"
+    exit "$code"
+  ) > "$log_file" 2>&1 &
+}
 
 # Collect refs for mirror sync (newrev:ref pairs; only refs/heads/*)
 MIRROR_PAIRS=""
@@ -71,20 +129,15 @@ if [ -n "$BUILD_SPECS" ]; then
     rest=${spec#*:}
     SHA=${rest%%:*}
     SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
-    (
-      exec "$BUILD_SCRIPT" "$GIT_DIR_REPO" "$BRANCH" "$SHA" "$REPO_NAME" \
-        >> "$BUILD_LOGS/$REPO_NAME.log" 2>&1
-    ) &
+    run_build_logged "$BRANCH" "$SHA" || echo "[git-server] failed to create build log" >&2
     echo "[git-server] queued build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
   done
 fi
 
 # Async: mirror sync (ADR-0003)
 if [ -n "$MIRROR_PAIRS" ]; then
-  (
-    exec "$MIRROR_SCRIPT" "$GIT_DIR_REPO" "$REPO_NAME" $MIRROR_PAIRS \
-      >> "$MIRROR_LOGS/$REPO_NAME.log" 2>&1
-  ) &
+  # Intentional unquoted expansion: each collected newrev:ref pair is one argument.
+  run_mirror_logged $MIRROR_PAIRS || echo "[git-server] failed to create mirror log" >&2
   echo "[git-server] queued mirror sync for $REPO_NAME" >&2
 fi
 

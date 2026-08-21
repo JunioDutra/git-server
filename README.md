@@ -21,6 +21,21 @@ HTTP service to create bare git repositories on this server (LXC 109, Alpine).
 
 `GET /repo/<name>/log` — recent commits (plain list).
 
+`GET /repo/<name>/hook-logs` — history of build and mirror hook executions.
+
+- `GET /repo/<name>/hook-logs/<id>` displays a log safely; large logs show the
+  last 1 MiB and link to `GET /repo/<name>/hook-logs/<id>/raw` for download.
+- `DELETE /repo/<name>/hook-logs/<id>` removes one execution log.
+- `DELETE /repo/<name>/hook-logs` removes all execution logs for the repo.
+
+Each asynchronous build or mirror invocation receives its own file under
+`/home/git/logs/hooks/<repo>/`. The dispatcher records its type, start time,
+branch/SHA or refs, and final exit code. The UI keeps these files for 30 days
+by default; configure `GIT_HOOK_LOGS_ROOT` and `GIT_HOOK_LOG_RETENTION_DAYS`
+to change storage location and retention. Existing aggregate files in
+`/home/git/logs/builds/` and `/home/git/logs/mirrors/` appear as legacy entries
+until removed. Deleting a repository also removes all of its hook logs.
+
 Browse routes accept `?ref=<branch>`. Repository, file and log pages include a
 branch selector and preserve the selected branch in navigation links. If a bare
 repository has a dangling `HEAD`, the UI falls back to `main`, `master`, or the
@@ -48,6 +63,11 @@ Each repo page has a **Delete repository** button (red). It shows a native JS
 `confirm()` dialog with a "cannot be undone" warning, then `DELETE /repo/<name>`.
 On success it redirects back to the index. Works for empty repos too (no commits
 yet). API: `DELETE /repo/<name>` returns JSON.
+
+Every repository root also has a **hook logs** link. The list allows viewing or
+downloading each execution, deleting a selected log, or clearing all logs after
+confirmation. A missing end marker is shown as running/incomplete, which also
+makes interrupted background tasks visible.
 
 ## Atualizar o servidor
 
@@ -77,6 +97,12 @@ exit
 exit
 ```
 
+The repository `deploy.sh` also installs the canonical `post-receive` and
+`mirror-sync.sh` into `/home/git/hooks`, creates `/home/git/logs/hooks` as
+`git:git`, and refreshes the hook symlink in every existing bare repository.
+New repositories receive the same symlink during creation. The deploy does not
+replace the separately managed `build-image.sh`.
+
 Para rollback, liste os backups no container e substitua `BACKUP` pelo arquivo que
 quer restaurar:
 
@@ -96,7 +122,9 @@ root-owned and SSH push fails with "dubious ownership".
 
 ## Files
 
-- `app.py` — stdlib-only Python HTTP server (no deps). Includes repo creation API + web UI to browse repos/files.
+- `app.py` — stdlib-only Python HTTP server (no deps), including hook-log browser and deletion API.
+- `post-receive` — canonical dispatcher that records a separate log for each build or mirror task.
+- `mirror-sync.sh` — mirror worker; its stdout/stderr is captured by the dispatcher.
 - `start.sh` — stop old + start as git user
 - `deploy.sh` — install python3/curl + copy app.py into container
 - `check.sh` — health check endpoint
