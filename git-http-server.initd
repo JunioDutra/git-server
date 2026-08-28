@@ -9,6 +9,14 @@ command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/opt/git-http-server/server.log"
 error_log="/opt/git-http-server/server.log"
+config_file="${GIT_SERVER_ENV_FILE:-/etc/git-server/build.env}"
+
+if [ -r "$config_file" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$config_file"
+    set +a
+fi
 
 depend() {
     need net
@@ -16,6 +24,16 @@ depend() {
 }
 
 start_pre() {
+    local missing=""
+    local var value
+    for var in GIT_HTTP_HOST GIT_HTTP_PORT GIT_SSH_HOST GIT_DEFAULT_BRANCH; do
+        eval "value=\${$var:-}"
+        [ -n "$value" ] || missing="$missing $var"
+    done
+    if [ -n "$missing" ]; then
+        eerror "Missing required environment variables:$missing"
+        return 1
+    fi
     checkpath -d -o git:git /opt/git-http-server
     checkpath -f -o git:git /opt/git-http-server/server.log
 }

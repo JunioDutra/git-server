@@ -5,6 +5,12 @@
 - **Context**: Git server (LXC 109) + automatic Docker builds on push
 - **Tags**: `adr`, `git-hooks`, `docker`, `buildx`, `registry`, `homelab`
 
+> **Superseded in part by ADR-0004**: the single `dockerfile:` schema and
+> hard-coded registry/BuildKit destinations are replaced by multi-build
+> configuration and required environment variables. The hook trigger, remote
+> builder architecture, SHA/latest tagging policy, and asynchronous behavior
+> remain applicable.
+
 ---
 
 ## 1. Context

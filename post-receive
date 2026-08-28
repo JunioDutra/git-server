@@ -1,7 +1,7 @@
 #!/bin/sh
 # post-receive hook (canonical, ADR-0002-D1/D2 + ADR-0003-D2/D4)
 # Dispatcher: reads pushed refs from stdin (old new ref) and triggers
-#   - automated build (ADR-0002)  via build-image.sh
+#   - automated build (ADR-0002/ADR-0004) via build_image.py
 #   - mirror sync (ADR-0003)      via mirror-sync.sh
 # both in background, so the push never blocks.
 #
@@ -14,19 +14,27 @@
 
 set -u
 
+ENV_FILE="${GIT_SERVER_ENV_FILE:-/etc/git-server/build.env}"
+if [ -r "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
 # Resolve the CANONICAL hook dir even when invoked via a symlink
 # (e.g. /home/git/repos/<name>.git/hooks/post-receive -> /home/git/hooks/post-receive).
 # Using readlink -f ensures $0 resolves to the real canonical path, so
 # $HOOK_DIR points at /home/git/hooks and the canonical scripts are used.
 # (Without this, dirname $0 returned the symlink dir, so the hook used
-# stale per-repo copies of build-image.sh/mirror-sync.sh instead of the
+# stale per-repo copies of build_image.py/mirror-sync.sh instead of the
 # canonical ones — causing mirror sync to fail only on real SSH pushes.)
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 HOOK_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 GIT_DIR_REPO="$(pwd)"          # bare repo dir (hooks run with cwd = repo)
 
 # Canonical scripts live next to this hook
-BUILD_SCRIPT="$HOOK_DIR/build-image.sh"
+BUILD_SCRIPT="$HOOK_DIR/build_image.py"
 MIRROR_SCRIPT="$HOOK_DIR/mirror-sync.sh"
 HOOK_LOGS_ROOT="${GIT_HOOK_LOGS_ROOT:-/home/git/logs/hooks}"
 HOOK_LOG_RETENTION_DAYS="${GIT_HOOK_LOG_RETENTION_DAYS:-30}"
@@ -43,31 +51,28 @@ case "$HOOK_LOG_RETENTION_DAYS" in
 esac
 find "$REPO_LOG_DIR" -type f -name '*.log' -mtime +"$HOOK_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 
-run_build_logged() {
+run_build_async() {
   branch=$1
   sha=$2
-  stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  tmp=$(mktemp "$REPO_LOG_DIR/${stamp}-build-XXXXXX") || return 1
-  log_file="$tmp.log"
-  mv "$tmp" "$log_file" || return 1
-  (
-    printf '%s\n' "# hook-log: type=build"
-    printf '%s\n' "# hook-log: repo=$REPO_NAME"
-    printf '%s\n' "# hook-log: started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%s\n' "# hook-log: branch=$branch"
-    printf '%s\n' "# hook-log: sha=$sha"
-    printf '%s\n' "# hook-log: --- output ---"
-    if [ -x "$BUILD_SCRIPT" ]; then
-      "$BUILD_SCRIPT" "$GIT_DIR_REPO" "$branch" "$sha" "$REPO_NAME"
-      code=$?
-    else
-      echo "build script not found or not executable: $BUILD_SCRIPT" >&2
-      code=127
-    fi
-    printf '%s\n' "# hook-log: ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%s\n' "# hook-log: exit=$code"
-    exit "$code"
-  ) > "$log_file" 2>&1 &
+  if [ -x "$BUILD_SCRIPT" ]; then
+    "$BUILD_SCRIPT" "$GIT_DIR_REPO" "$branch" "$sha" "$REPO_NAME" >/dev/null 2>&1 &
+  else
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    tmp=$(mktemp "$REPO_LOG_DIR/${stamp}-build-config-XXXXXX") || return 1
+    log_file="$tmp.log"
+    mv "$tmp" "$log_file" || return 1
+    {
+      printf '%s\n' "# hook-log: type=build-config"
+      printf '%s\n' "# hook-log: repo=$REPO_NAME"
+      printf '%s\n' "# hook-log: started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '%s\n' "# hook-log: branch=$branch"
+      printf '%s\n' "# hook-log: sha=$sha"
+      printf '%s\n' "# hook-log: --- output ---"
+      echo "build worker not found or not executable: $BUILD_SCRIPT"
+      printf '%s\n' "# hook-log: ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '%s\n' "# hook-log: exit=127"
+    } > "$log_file" 2>&1
+  fi
 }
 
 run_mirror_logged() {
@@ -129,7 +134,7 @@ if [ -n "$BUILD_SPECS" ]; then
     rest=${spec#*:}
     SHA=${rest%%:*}
     SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
-    run_build_logged "$BRANCH" "$SHA" || echo "[git-server] failed to create build log" >&2
+    run_build_async "$BRANCH" "$SHA" || echo "[git-server] failed to queue build" >&2
     echo "[git-server] queued build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
   done
 fi

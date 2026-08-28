@@ -1,57 +1,72 @@
 #!/bin/bash
-# Deploy git-http-server to Proxmox LXC 109 (git server) and start via OpenRC
-# so the service survives container reboots. Runs as git user.
+# Deploy git-http-server and canonical hooks to the configured Proxmox LXC.
 set -euo pipefail
 
-WS="/home/srv/.picoclaw/workspace/scripts/git_http_server"
-CT_SRC="$WS/app.py"
-INIT_SRC="$WS/git-http-server.initd"
-HOOK_SRC="$WS/post-receive"
-MIRROR_SRC="$WS/mirror-sync.sh"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ENV_FILE="${GIT_SERVER_ENV_FILE:-$SCRIPT_DIR/.env}"
+if [[ -r "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+required=(PROXMOX_HOST PROXMOX_USER GIT_CONTAINER_ID GIT_HTTP_PORT)
+missing=()
+for name in "${required[@]}"; do
+  [[ -n "${!name:-}" ]] || missing+=("$name")
+done
+if ((${#missing[@]})); then
+  echo "Missing required environment variables: ${missing[*]}" >&2
+  exit 2
+fi
+
+PROX_TARGET="$PROXMOX_USER@$PROXMOX_HOST"
 CT_DIR="/opt/git-http-server"
-CT="109"
-PROX="192.168.2.150"
-LOG="/home/srv/.picoclaw/workspace/logs/git_http_deploy.log"
+DEPLOY_LOG="${DEPLOY_LOG:-$SCRIPT_DIR/git_http_deploy.log}"
 
 {
-echo "=== Deploy git-http-server to container $CT ==="
+echo "=== Deploy git-http-server to container $GIT_CONTAINER_ID ==="
 
-echo "--- 1. Create dir on container ---"
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- mkdir -p $CT_DIR" 2>&1
+echo "--- 1. Validate protected runtime environment ---"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'test -r /etc/git-server/build.env && set -a && . /etc/git-server/build.env && set +a && for name in GIT_HTTP_HOST GIT_HTTP_PORT GIT_SSH_HOST GIT_DEFAULT_BRANCH REGISTRY_ADDRESS REGISTRY_USER REGISTRY_PASSWORD REGISTRY_INSECURE BUILDKIT_ADDRESS BUILDX_BUILDER; do value=\$(printenv \"\$name\"); [ -n \"\$value\" ] || { echo missing:\$name >&2; exit 2; }; done'" 2>&1
 
-echo "--- 2. Copy app.py via stdin ---"
-cat "$CT_SRC" | ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'cat > $CT_DIR/app.py'" 2>&1
+echo "--- 2. Install runtime dependencies and directories ---"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- apk add --no-cache python3 py3-yaml" 2>&1
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'mkdir -p $CT_DIR /home/git/hooks /home/git/logs/hooks && chown -R git:git $CT_DIR /home/git/hooks /home/git/logs'" 2>&1
 
-echo "--- 3. Copy init script + enroll in openrc ---"
-cat "$INIT_SRC" | ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'cat > /etc/init.d/git-http-server && chmod +x /etc/init.d/git-http-server'" 2>&1
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- rc-update add git-http-server default" 2>&1
+echo "--- 3. Stage application, service, and hooks ---"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'cat > $CT_DIR/app.py.new'" < "$SCRIPT_DIR/app.py"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'cat > /etc/init.d/git-http-server.new'" < "$SCRIPT_DIR/git-http-server.initd"
+for file in post-receive mirror-sync.sh build_image.py; do
+  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+    "pct exec $GIT_CONTAINER_ID -- sh -c 'cat > /home/git/hooks/$file.new'" < "$SCRIPT_DIR/$file"
+done
 
-echo "--- 4. Install canonical hooks and per-execution log storage ---"
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'mkdir -p /home/git/hooks /home/git/logs/hooks && chown -R git:git /home/git/hooks /home/git/logs'" 2>&1
-cat "$HOOK_SRC" | ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'cat > /home/git/hooks/post-receive && chown git:git /home/git/hooks/post-receive && chmod 0755 /home/git/hooks/post-receive'" 2>&1
-cat "$MIRROR_SRC" | ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'cat > /home/git/hooks/mirror-sync.sh && chown git:git /home/git/hooks/mirror-sync.sh && chmod 0755 /home/git/hooks/mirror-sync.sh'" 2>&1
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'for repo in /home/git/repos/*.git; do [ -d \"\$repo\" ] || continue; mkdir -p \"\$repo/hooks\"; ln -sfn /home/git/hooks/post-receive \"\$repo/hooks/post-receive\"; done'" 2>&1
+echo "--- 4. Validate staged files ---"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- python3 -m py_compile $CT_DIR/app.py.new /home/git/hooks/build_image.py.new" 2>&1
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -n /home/git/hooks/post-receive.new" 2>&1
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -n /home/git/hooks/mirror-sync.sh.new" 2>&1
 
-echo "--- 5. Restart service (stops old process, starts via openrc) ---"
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- rc-service git-http-server restart" 2>&1
+echo "--- 5. Back up and activate ---"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'set -e; stamp=\$(date -u +%Y%m%dT%H%M%SZ); [ ! -f $CT_DIR/app.py ] || cp -p $CT_DIR/app.py $CT_DIR/app.py.bak-\$stamp; [ ! -f /etc/init.d/git-http-server ] || cp -p /etc/init.d/git-http-server /etc/init.d/git-http-server.bak-\$stamp; for file in post-receive mirror-sync.sh build_image.py; do [ ! -f /home/git/hooks/\$file ] || cp -p /home/git/hooks/\$file /home/git/hooks/\$file.bak-\$stamp; done; mv $CT_DIR/app.py.new $CT_DIR/app.py; mv /etc/init.d/git-http-server.new /etc/init.d/git-http-server; for file in post-receive mirror-sync.sh build_image.py; do mv /home/git/hooks/\$file.new /home/git/hooks/\$file; done; chown git:git $CT_DIR/app.py /home/git/hooks/post-receive /home/git/hooks/mirror-sync.sh /home/git/hooks/build_image.py; chmod 0644 $CT_DIR/app.py; chmod 0755 /etc/init.d/git-http-server /home/git/hooks/post-receive /home/git/hooks/mirror-sync.sh /home/git/hooks/build_image.py; for repo in /home/git/repos/*.git; do [ -d \"\$repo\" ] || continue; mkdir -p \"\$repo/hooks\"; ln -sfn /home/git/hooks/post-receive \"\$repo/hooks/post-receive\"; done'" 2>&1
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- rc-update add git-http-server default" 2>&1
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- rc-service git-http-server restart" 2>&1
 
-echo "--- 6. Health check from Proxmox host ---"
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'curl -s http://127.0.0.1:8080/ || wget -qO- http://127.0.0.1:8080/'" 2>&1
+echo "--- 6. Health check ---"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'wget -qO- http://127.0.0.1:$GIT_HTTP_PORT/ >/dev/null && rc-service git-http-server status'" 2>&1
 
-echo "--- 7. Process owner check ---"
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$PROX" \
-  "pct exec $CT -- sh -c 'ps aux | grep -E \"python3 /opt/git-http-server/app.py\" | grep -v grep'" 2>&1
-
-echo "== DONE - server under OpenRC, survives reboot =="
-} 2>&1 | tee "$LOG"
-echo "Log: $LOG"
+echo "== DONE =="
+} 2>&1 | tee "$DEPLOY_LOG"

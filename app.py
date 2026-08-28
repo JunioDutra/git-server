@@ -12,8 +12,10 @@ Body for /create: JSON {"name": "my-repo"}  (or form field name=my-repo)
 
 Config via env:
   GIT_REPOS_ROOT  (default: /home/git/repos)
-  GIT_HTTP_HOST   (default: 0.0.0.0)
-  GIT_HTTP_PORT   (default: 8080)
+  GIT_HTTP_HOST   (required)
+  GIT_HTTP_PORT   (required)
+  GIT_SSH_HOST    (required)
+  GIT_DEFAULT_BRANCH (required)
 """
 
 import html
@@ -31,8 +33,10 @@ REPOS_ROOT = os.environ.get("GIT_REPOS_ROOT", "/home/git/repos")
 HOOK_LOGS_ROOT = os.environ.get("GIT_HOOK_LOGS_ROOT", "/home/git/logs/hooks")
 HOOK_LOG_RETENTION_DAYS = int(os.environ.get("GIT_HOOK_LOG_RETENTION_DAYS", "30"))
 HOOKS_ROOT = os.environ.get("GIT_HOOKS_ROOT", "/home/git/hooks")
-HOST = os.environ.get("GIT_HTTP_HOST", "0.0.0.0")
-PORT = int(os.environ.get("GIT_HTTP_PORT", "8080"))
+HOST = os.environ.get("GIT_HTTP_HOST")
+PORT = os.environ.get("GIT_HTTP_PORT")
+GIT_SSH_HOST = os.environ.get("GIT_SSH_HOST")
+GIT_DEFAULT_BRANCH = os.environ.get("GIT_DEFAULT_BRANCH")
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 LOG_ID_RE = re.compile(r"^[A-Za-z0-9._-]+\.log$")
@@ -44,7 +48,6 @@ README_CANDIDATES = [
     "Readme.md", "README.markdown", "README.txt", "README",
 ]
 MARKDOWN_EXTENSIONS = {".md", ".markdown"}
-GIT_SSH_HOST = "git-server"
 
 
 def get_readme(repo, ref):
@@ -296,7 +299,9 @@ def select_branch(repo, requested=None):
     head = head.strip() if head else None
     if head in branches:
         return head, branches
-    for candidate in ("main", "master"):
+    for candidate in dict.fromkeys((GIT_DEFAULT_BRANCH, "main", "master")):
+        if candidate is None:
+            continue
         if candidate in branches:
             return candidate, branches
     return (branches[0] if branches else None), branches
@@ -393,7 +398,7 @@ def create_bare_repo(name):
     if os.path.exists(path):
         return False, f"repo already exists: {name}"
     proc = subprocess.run(
-        ["git", "init", "--bare", "-b", "main", path],
+        ["git", "init", "--bare", "-b", GIT_DEFAULT_BRANCH, path],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -504,7 +509,7 @@ def parse_hook_log(path, log_id, legacy=False):
             meta[key] = value
     meta["type"] = meta.get("type", "unknown")
     meta["started_at"] = meta.get("started_at", "")
-    meta["detail"] = meta.get("branch", meta.get("refs", ""))
+    meta["detail"] = meta.get("refs", meta.get("branch", ""))
     exit_match = re.search(r"# hook-log: exit=([-0-9]+)", footer)
     if exit_match:
         meta["status"] = "ok" if exit_match.group(1) == "0" else "failed"
@@ -750,26 +755,42 @@ def log_page(name, repo, branch, branches):
 
 def hook_logs_page(name):
     records = list_hook_logs(name)
-    rows = []
-    for record in records:
-        status = record["status"]
-        status_label = {"ok": "completed", "failed": "failed", "open": "running/incomplete",
-                        "legacy": "legacy"}.get(status, status)
-        status_class = {"ok": "status-ok", "failed": "status-failed", "open": "status-open"}.get(status, "muted")
-        detail = record.get("detail") or "—"
-        started = record.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record["mtime"]))
-        href = f"/repo/{name}/hook-logs/{record['id']}"
-        rows.append(
-            f'<tr><td><a href="{html.escape(href, quote=True)}">{html.escape(started)}</a></td>'
-            f'<td>{html.escape(record["type"])}</td><td><code>{html.escape(detail)}</code></td>'
-            f'<td>{record["size"]:,} bytes</td><td class="{status_class}">{status_label}</td>'
-            f'<td><button class="btn-danger" onclick="deleteHookLog(\'{js_str(name)}\', \'{js_str(record["id"])}\')">Delete</button></td></tr>'
-        )
-    content = "".join(rows) or '<tr><td colspan="6" class="muted">No hook logs yet.</td></tr>'
+    current = [record for record in records if not record["legacy"]]
+    legacy = [record for record in records if record["legacy"]]
+
+    def render_rows(items):
+        rows = []
+        for record in items:
+            status = record["status"]
+            status_label = {"ok": "completed", "failed": "failed", "open": "running/incomplete",
+                            "legacy": "legacy"}.get(status, status)
+            status_class = {"ok": "status-ok", "failed": "status-failed", "open": "status-open"}.get(status, "muted")
+            detail = record.get("detail") or "—"
+            build_name = record.get("build") or "—"
+            image = record.get("image") or "—"
+            started = record.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record["mtime"]))
+            href = f"/repo/{name}/hook-logs/{record['id']}"
+            rows.append(
+                f'<tr><td><a href="{html.escape(href, quote=True)}">{html.escape(started)}</a></td>'
+                f'<td>{html.escape(record["type"])}</td><td><code>{html.escape(build_name)}</code></td>'
+                f'<td><code>{html.escape(detail)}</code></td><td><code>{html.escape(image)}</code></td>'
+                f'<td>{record["size"]:,} bytes</td><td class="{status_class}">{status_label}</td>'
+                f'<td><button class="btn-danger" onclick="deleteHookLog(\'{js_str(name)}\', \'{js_str(record["id"])}\')">Delete</button></td></tr>'
+            )
+        return "".join(rows)
+
+    current_rows = render_rows(current) or '<tr><td colspan="8" class="muted">No hook executions yet.</td></tr>'
+    legacy_section = ""
+    if legacy:
+        legacy_section = f"""<h2>Legacy aggregate logs</h2>
+<p class="muted">These files contain multiple executions recorded before per-execution logging was introduced.</p>
+<table><thead><tr><th>Started</th><th>Type</th><th>Build</th><th>Branch / refs</th><th>Image</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{render_rows(legacy)}</tbody></table>"""
     body = f"""<h1>{html.escape(name)} — hook logs</h1>
 <p><a href="/repo/{html.escape(name)}/">← files</a> · <a href="/">all repos</a></p>
 <p><button class="btn-danger" onclick="clearHookLogs('{js_str(name)}')">Delete all logs</button></p>
-<table><thead><tr><th>Started</th><th>Type</th><th>Branch / refs</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{content}</tbody></table>"""
+<h2>Hook executions</h2>
+<table><thead><tr><th>Started</th><th>Type</th><th>Build</th><th>Branch / refs</th><th>Image</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{current_rows}</tbody></table>
+{legacy_section}"""
     return page(f"{name} — hook logs", body + JS_DELETE_HOOK_LOGS)
 
 
@@ -953,6 +974,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    missing = [name for name, value in (("GIT_HTTP_HOST", HOST), ("GIT_HTTP_PORT", PORT),
+                                         ("GIT_SSH_HOST", GIT_SSH_HOST),
+                                         ("GIT_DEFAULT_BRANCH", GIT_DEFAULT_BRANCH)) if not value]
+    if missing:
+        raise RuntimeError(f"missing required environment variables: {', '.join(missing)}")
     os.makedirs(REPOS_ROOT, exist_ok=True)
     os.makedirs(HOOK_LOGS_ROOT, exist_ok=True)
     cleanup_hook_logs()
@@ -964,7 +990,7 @@ def main():
 
     threading.Thread(target=maintain_hook_logs, daemon=True).start()
     print(f"git-server listening on {HOST}:{PORT} (repos root: {REPOS_ROOT})")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    ThreadingHTTPServer((HOST, int(PORT)), Handler).serve_forever()
 
 
 if __name__ == "__main__":

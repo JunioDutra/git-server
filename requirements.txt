@@ -1,1 +1,2 @@
-# git-http-server: repo creation service (stdlib only, no deps)
+# Runtime dependency used by the multi-build repository.yaml parser.
+PyYAML==6.0.3

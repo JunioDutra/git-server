@@ -28,13 +28,17 @@ class HookLogTests(unittest.TestCase):
         app.REPOS_ROOT, app.HOOK_LOGS_ROOT = self.values
         self.tmp.cleanup()
 
-    def write_log(self, log_id, exit_code=0, content="output"):
+    def write_log(self, log_id, exit_code=0, content="output", build=None, image=None):
         directory = app.hook_log_dir("demo")
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, log_id)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("# hook-log: type=build\n# hook-log: started_at=2026-08-21T12:00:00Z\n")
             fh.write("# hook-log: branch=main\n# hook-log: --- output ---\n")
+            if build:
+                fh.write(f"# hook-log: build={build}\n")
+            if image:
+                fh.write(f"# hook-log: image={image}\n")
             fh.write(content)
             fh.write(f"\n# hook-log: exit={exit_code}\n")
         return path
@@ -48,6 +52,17 @@ class HookLogTests(unittest.TestCase):
         records = app.list_hook_logs("demo")
         self.assertEqual(3, len(records))
         self.assertEqual({"ok", "failed", "legacy"}, {record["status"] for record in records})
+
+    def test_page_separates_current_and_legacy_and_shows_build_image(self):
+        self.write_log("20260821T120000Z-build-aaaaaa.log", build="api",
+                       image="registry.local/demo/api")
+        os.makedirs(self.legacy, exist_ok=True)
+        with open(self.legacy_paths("demo")["legacy-build.log"], "w", encoding="utf-8") as fh:
+            fh.write("old build")
+        output = app.hook_logs_page("demo")
+        self.assertIn("Hook executions", output)
+        self.assertIn("Legacy aggregate logs", output)
+        self.assertIn("registry.local/demo/api", output)
 
     def test_rejects_traversal_and_deletes_a_single_log(self):
         log_id = "20260821T120000Z-build-aaaaaa.log"
