@@ -1,3 +1,5 @@
 .env
 __pycache__/
 *.pyc
+git_http_deploy.log
+git_http_flow.log
