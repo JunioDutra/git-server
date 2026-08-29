@@ -33,6 +33,12 @@ REGISTRY_INSECURE=false
 
 O registry usa TLS e autenticação Basic. Usuário e senha ficam somente no ambiente operacional do servidor.
 
+O hook não consome essas credenciais. Ele envia somente repositório, branch e
+SHA ao socket Unix local. O serviço OpenRC `git-build-dispatcher` recebe as
+credenciais por `/etc/conf.d/git-build-dispatcher`, arquivo protegido que é
+gerado pelo deploy a partir do ambiente do LXC. O gerador, o serviço, o cliente,
+o dispatcher e o worker são todos versionados neste repositório.
+
 Para cada push, são esperadas as tags:
 
 - `registry.dblsoft.xyz/da-school/<nome>:<short-sha>` em qualquer branch;
@@ -46,3 +52,7 @@ Para cada push, são esperadas as tags:
 4. Um push em `master` publica SHA curto e `latest` para as três imagens.
 5. A falha de um item é registrada, os itens seguintes ainda são tentados e o worker termina com falha agregada.
 6. Os testes existentes de paths, autenticação e sanitização continuam aprovados.
+7. Um job aceito é persistido antes da resposta e recuperado após reinício do
+   dispatcher; indisponibilidade ou fila cheia não invalida o push e gera log
+   diagnóstico.
+8. Registry e BuildKit não ficam disponíveis no ambiente dos processos SSH.

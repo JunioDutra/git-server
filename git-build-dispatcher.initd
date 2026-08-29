@@ -1,0 +1,37 @@
+#!/sbin/openrc-run
+
+name="git-build-dispatcher"
+description="Isolated durable dispatcher for Git post-receive builds"
+command="/usr/bin/python3"
+command_args="/home/git/hooks/build_dispatcher.py"
+command_user="git:git"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/home/git/logs/build-dispatcher.log"
+error_log="/home/git/logs/build-dispatcher.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    local missing=""
+    local var value
+    for var in REGISTRY_ADDRESS REGISTRY_USER REGISTRY_PASSWORD REGISTRY_INSECURE BUILDKIT_ADDRESS BUILDX_BUILDER GIT_DEFAULT_BRANCH; do
+        value="$(printenv "$var" 2>/dev/null || true)"
+        [ -n "$value" ] || missing="$missing $var"
+    done
+    if [ -n "$missing" ]; then
+        eerror "Missing required build environment variables:$missing"
+        return 1
+    fi
+    checkpath -d -m 0750 -o git:git /run/git-server
+    checkpath -d -m 0750 -o git:git "${GIT_BUILD_QUEUE_ROOT:-/home/git/build-queue}"
+    checkpath -d -m 0750 -o git:git /home/git/logs
+    checkpath -f -m 0640 -o git:git /home/git/logs/build-dispatcher.log
+}
+
+stop_post() {
+    rm -f "${GIT_BUILD_SOCKET:-/run/git-server/build.sock}"
+}

@@ -7,9 +7,11 @@ build multiple container images through a remote BuildKit daemon.
 ## Configuration
 
 Infrastructure destinations and credentials are never hard-coded. Runtime
-variables must be present in the LXC environment and inherited by both OpenRC
-services and SSH/git-shell processes. The deploy validates their presence in a
-fresh container process without displaying values.
+variables must be present in the LXC environment. The deploy validates their
+presence in a fresh container process without displaying values, then writes
+the build-only values to the protected OpenRC configuration
+`/etc/conf.d/git-build-dispatcher` (`0640 root:git`). Registry credentials are
+not inherited by SSH/git-shell processes.
 
 Copy `.env.example` to `.env` only for local operational scripts. `.env` is
 ignored by Git, and its path can be changed with `GIT_SERVER_OPS_ENV_FILE`.
@@ -19,8 +21,9 @@ cp .env.example .env
 chmod 0600 .env
 ```
 
-The application and hooks consume the inherited environment directly; they do
-not load a repository-managed or application-specific environment file.
+The HTTP application and hook consume only non-secret inherited settings. The
+build dispatcher consumes its service-scoped OpenRC configuration. No
+repository-managed environment file is loaded.
 
 Required runtime variables:
 
@@ -40,7 +43,35 @@ Operational scripts additionally require `PROXMOX_HOST`, `PROXMOX_USER`,
 `GIT_TEST_SSH_KEY`. See [.env.example](.env.example) for the complete template.
 
 Paths and retention can be overridden with `GIT_REPOS_ROOT`, `GIT_HOOKS_ROOT`,
-`GIT_HOOK_LOGS_ROOT`, and `GIT_HOOK_LOG_RETENTION_DAYS`.
+`GIT_HOOK_LOGS_ROOT`, and `GIT_HOOK_LOG_RETENTION_DAYS`. The durable build queue
+also accepts `GIT_BUILD_QUEUE_ROOT` (default `/home/git/build-queue`),
+`GIT_BUILD_QUEUE_SIZE` (default `100`), `GIT_BUILD_WORKERS` (default `1`), and
+`GIT_BUILD_WORKER` (default `/home/git/hooks/build_image.py`).
+
+## Isolated build dispatch
+
+The build path deliberately crosses a small privilege boundary:
+
+```text
+git push -> post-receive -> build_submit.py -> Unix socket
+                                             |
+                         git-build-dispatcher (OpenRC, user git)
+                                             |
+                         durable .job -> build_image.py -> BuildKit/registry
+```
+
+The hook submits only repository, branch, and commit SHA and waits at most two
+seconds for queue acknowledgement. The dispatcher validates the bounded JSON
+request and repository path, atomically persists it under
+`/home/git/build-queue`, then runs the build using its isolated credentials.
+The `.job` file is deleted only after the worker returns; pending files are
+requeued at startup, so accepted work survives a dispatcher restart with
+at-least-once semantics. A repeated job is safe because it publishes the same
+commit-derived tag.
+
+If submission fails, the Git push still succeeds and a `build-dispatcher`
+diagnostic entry appears in the repository hook logs. Dispatcher service output
+is in `/home/git/logs/build-dispatcher.log`.
 
 ## Multiple builds
 
@@ -122,7 +153,9 @@ against traversal.
 
 ## Deploy and operations
 
-Configure the LXC runtime environment and the local operational `.env`, then:
+Configure the LXC runtime environment and the local operational `.env`. Restart
+the LXC after changing its environment so PID 1 and new `pct exec` processes see
+the values, then deploy:
 
 ```bash
 ./deploy.sh
@@ -130,11 +163,21 @@ Configure the LXC runtime environment and the local operational `.env`, then:
 ```
 
 `deploy.sh` derives sources from its own directory, installs Python/PyYAML,
-deploys the HTTP application and all canonical hook workers, refreshes hook
-symlinks, validates syntax, keeps timestamped backups of replaced files,
-updates the OpenRC environment allowlist, restarts SSH and HTTP, and performs a
-retrying health check. The chosen global environment model makes registry
-credentials available to services started by OpenRC and to SSH hook processes.
+deploys the HTTP application, both OpenRC services, the submission client,
+dispatcher, and canonical hook workers, refreshes hook symlinks, validates
+syntax, and keeps timestamped backups. It removes the old global credential
+allowlist, generates the protected dispatcher configuration, restarts the
+dispatcher and HTTP service (not SSH), and verifies both HTTP and the Unix
+socket.
+
+After an LXC reboot, OpenRC starts `git-build-dispatcher` and `git-http-server`
+automatically. No manual SSH restart is required. Useful diagnostics:
+
+```bash
+rc-service git-build-dispatcher status
+test -S /run/git-server/build.sock
+tail -50 /home/git/logs/build-dispatcher.log
+```
 
 Other commands:
 
@@ -150,8 +193,12 @@ The HTTP service must run as `git`; running it as root causes ownership and
 
 - `app.py` — HTTP API and web UI.
 - `build_image.py` — multi-build parser/orchestrator.
-- `post-receive` — asynchronous dispatcher.
+- `build_submit.py` — credential-free Unix socket client used by the hook.
+- `build_dispatcher.py` — isolated durable queue and worker dispatcher.
+- `configure_build_env.py` — protected OpenRC configuration generator.
+- `post-receive` — hook dispatcher and mirror trigger.
 - `mirror-sync.sh` — mirror worker.
 - `git-http-server.initd` — OpenRC service.
+- `git-build-dispatcher.initd` — isolated build OpenRC service.
 - `.env.example` — configuration contract without secrets.
 - `deploy.sh`, `start.sh`, `check.sh`, `flow.sh` — operational scripts.

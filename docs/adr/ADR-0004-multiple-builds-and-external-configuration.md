@@ -32,9 +32,9 @@ credentials must remain deployment configuration rather than source policy.
 7. Root configuration accepts only `build`, `mirrors`, and `default_branch`;
    unknown root or build fields fail before execution.
 8. Runtime and operational infrastructure values are documented in
-   `.env.example`. Runtime values are inherited from the LXC environment by
-   OpenRC and SSH/git-shell processes. Deploy validates presence, manages only
-   the OpenRC name allowlist, restarts SSH, and never displays or manages values.
+   `.env.example`. The original global environment and dispatch model is
+   superseded by ADR-0005; registry credentials are not inherited by
+   SSH/git-shell processes.
 
 ## Consequences
 
@@ -45,8 +45,7 @@ credentials must remain deployment configuration rather than source policy.
   valid item does not hide the outcome of later items.
 - Deployments must provision the required environment and `py3-yaml` before
   activating the worker.
-- The accepted global environment model exposes registry credentials to
-  services allowed through OpenRC and to SSH child processes.
+- ADR-0005 confines registry credentials to a dedicated build service.
 - ADR-0002 remains authoritative for hook triggering and remote-build topology,
   but its single-build schema and fixed endpoint examples are superseded. IPs
   retained in older ADRs describe historical deployments, not active defaults.

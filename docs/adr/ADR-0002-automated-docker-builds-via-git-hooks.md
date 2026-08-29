@@ -10,6 +10,10 @@
 > configuration and required environment variables. The hook trigger, remote
 > builder architecture, SHA/latest tagging policy, and asynchronous behavior
 > remain applicable.
+>
+> **Superseded in part by ADR-0005**: the hook no longer starts the build
+> process itself. It submits a durable job to the isolated OpenRC dispatcher;
+> per-execution logs replace the historical aggregate build log.
 
 ---
 

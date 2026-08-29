@@ -1,9 +1,10 @@
 #!/bin/sh
 # post-receive hook (canonical, ADR-0002-D1/D2 + ADR-0003-D2/D4)
 # Dispatcher: reads pushed refs from stdin (old new ref) and triggers
-#   - automated build (ADR-0002/ADR-0004) via build_image.py
+#   - isolated build submission via build_submit.py and the OpenRC dispatcher
 #   - mirror sync (ADR-0003)      via mirror-sync.sh
-# both in background, so the push never blocks.
+# Build submission is a short local socket operation; execution stays detached
+# inside the dispatcher, so the push never waits for BuildKit or the registry.
 #
 # Installed at /home/git/hooks/post-receive and symlinked/templated into
 # every bare repo. This is the ONLY canonical copy.
@@ -19,14 +20,14 @@ set -u
 # Using readlink -f ensures $0 resolves to the real canonical path, so
 # $HOOK_DIR points at /home/git/hooks and the canonical scripts are used.
 # (Without this, dirname $0 returned the symlink dir, so the hook used
-# stale per-repo copies of build_image.py/mirror-sync.sh instead of the
+# stale per-repo copies of build_submit.py/mirror-sync.sh instead of the
 # canonical ones — causing mirror sync to fail only on real SSH pushes.)
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 HOOK_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 GIT_DIR_REPO="$(pwd)"          # bare repo dir (hooks run with cwd = repo)
 
 # Canonical scripts live next to this hook
-BUILD_SCRIPT="$HOOK_DIR/build_image.py"
+BUILD_SUBMIT="$HOOK_DIR/build_submit.py"
 MIRROR_SCRIPT="$HOOK_DIR/mirror-sync.sh"
 HOOK_LOGS_ROOT="${GIT_HOOK_LOGS_ROOT:-/home/git/logs/hooks}"
 HOOK_LOG_RETENTION_DAYS="${GIT_HOOK_LOG_RETENTION_DAYS:-30}"
@@ -43,28 +44,40 @@ case "$HOOK_LOG_RETENTION_DAYS" in
 esac
 find "$REPO_LOG_DIR" -type f -name '*.log' -mtime +"$HOOK_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 
-run_build_async() {
+write_build_queue_error() {
   branch=$1
   sha=$2
-  if [ -x "$BUILD_SCRIPT" ]; then
-    "$BUILD_SCRIPT" "$GIT_DIR_REPO" "$branch" "$sha" "$REPO_NAME" >/dev/null 2>&1 &
-  else
-    stamp=$(date -u +%Y%m%dT%H%M%SZ)
-    tmp=$(mktemp "$REPO_LOG_DIR/${stamp}-build-config-XXXXXX") || return 1
-    log_file="$tmp.log"
-    mv "$tmp" "$log_file" || return 1
-    {
-      printf '%s\n' "# hook-log: type=build-config"
-      printf '%s\n' "# hook-log: repo=$REPO_NAME"
-      printf '%s\n' "# hook-log: started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      printf '%s\n' "# hook-log: branch=$branch"
-      printf '%s\n' "# hook-log: sha=$sha"
-      printf '%s\n' "# hook-log: --- output ---"
-      echo "build worker not found or not executable: $BUILD_SCRIPT"
-      printf '%s\n' "# hook-log: ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      printf '%s\n' "# hook-log: exit=127"
-    } > "$log_file" 2>&1
+  code=$3
+  message=$4
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  tmp=$(mktemp "$REPO_LOG_DIR/${stamp}-build-dispatcher-XXXXXX") || return 1
+  log_file="$tmp.log"
+  mv "$tmp" "$log_file" || return 1
+  {
+    printf '%s\n' "# hook-log: type=build-dispatcher"
+    printf '%s\n' "# hook-log: repo=$REPO_NAME"
+    printf '%s\n' "# hook-log: started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "# hook-log: branch=$branch"
+    printf '%s\n' "# hook-log: sha=$sha"
+    printf '%s\n' "# hook-log: --- output ---"
+    printf '%s\n' "$message"
+    printf '%s\n' "# hook-log: ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "# hook-log: exit=$code"
+  } > "$log_file" 2>&1
+}
+
+queue_build() {
+  branch=$1
+  sha=$2
+  if [ ! -x "$BUILD_SUBMIT" ]; then
+    write_build_queue_error "$branch" "$sha" 127 \
+      "build submit client not found or not executable: $BUILD_SUBMIT"
+    return 1
   fi
+  error=$("$BUILD_SUBMIT" "$branch" "$sha" "$REPO_NAME" 2>&1) && return 0
+  code=$?
+  write_build_queue_error "$branch" "$sha" "$code" "$error"
+  return 1
 }
 
 run_mirror_logged() {
@@ -119,15 +132,18 @@ while read -r oldrev newrev ref; do
   esac
 done
 
-# Async: build (ADR-0002)
+# Queue isolated builds (ADR-0002/ADR-0004/ADR-0005)
 if [ -n "$BUILD_SPECS" ]; then
   for spec in $BUILD_SPECS; do
     BRANCH=${spec%%:*}
     rest=${spec#*:}
     SHA=${rest%%:*}
     SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
-    run_build_async "$BRANCH" "$SHA" || echo "[git-server] failed to queue build" >&2
-    echo "[git-server] queued build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
+    if queue_build "$BRANCH" "$SHA"; then
+      echo "[git-server] queued build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
+    else
+      echo "[git-server] failed to queue build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
+    fi
   done
 fi
 
