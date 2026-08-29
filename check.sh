@@ -2,7 +2,7 @@
 # Check the configured git-http-server container and test /create.
 set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-ENV_FILE="${GIT_SERVER_ENV_FILE:-$SCRIPT_DIR/.env}"
+ENV_FILE="${GIT_SERVER_OPS_ENV_FILE:-$SCRIPT_DIR/.env}"
 [[ -r "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
 : "${PROXMOX_HOST:?Missing PROXMOX_HOST}"
 : "${PROXMOX_USER:?Missing PROXMOX_USER}"

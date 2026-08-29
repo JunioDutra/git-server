@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-ENV_FILE="${GIT_SERVER_ENV_FILE:-$SCRIPT_DIR/.env}"
+ENV_FILE="${GIT_SERVER_OPS_ENV_FILE:-$SCRIPT_DIR/.env}"
 if [[ -r "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -28,9 +28,9 @@ DEPLOY_LOG="${DEPLOY_LOG:-$SCRIPT_DIR/git_http_deploy.log}"
 {
 echo "=== Deploy git-http-server to container $GIT_CONTAINER_ID ==="
 
-echo "--- 1. Validate protected runtime environment ---"
+echo "--- 1. Validate inherited container environment ---"
 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \
-  "pct exec $GIT_CONTAINER_ID -- sh -c 'test -r /etc/git-server/build.env && set -a && . /etc/git-server/build.env && set +a && for name in GIT_HTTP_HOST GIT_HTTP_PORT GIT_SSH_HOST GIT_DEFAULT_BRANCH REGISTRY_ADDRESS REGISTRY_USER REGISTRY_PASSWORD REGISTRY_INSECURE BUILDKIT_ADDRESS BUILDX_BUILDER; do value=\$(printenv \"\$name\"); [ -n \"\$value\" ] || { echo missing:\$name >&2; exit 2; }; done'" 2>&1
+  "pct exec $GIT_CONTAINER_ID -- sh -c 'missing=; for name in GIT_HTTP_HOST GIT_HTTP_PORT GIT_SSH_HOST GIT_DEFAULT_BRANCH REGISTRY_ADDRESS REGISTRY_USER REGISTRY_PASSWORD REGISTRY_INSECURE BUILDKIT_ADDRESS BUILDX_BUILDER; do value=\$(printenv \"\$name\"); [ -n \"\$value\" ] || missing=\"\$missing \$name\"; done; [ -z \"\$missing\" ] || { echo \"Missing required container environment variables:\$missing\" >&2; exit 2; }'" 2>&1
 
 echo "--- 2. Install runtime dependencies and directories ---"
 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PROX_TARGET" \

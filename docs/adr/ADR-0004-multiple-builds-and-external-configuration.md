@@ -28,8 +28,9 @@ credentials must remain deployment configuration rather than source policy.
 6. The canonical worker is versioned as `build_image.py`. Global configuration,
    authentication, or builder failures receive diagnostic logs.
 7. Runtime and operational infrastructure values are documented in
-   `.env.example`. Secrets remain in a protected, untracked environment file;
-   deploy validates but never manages their values.
+   `.env.example`. Runtime values are inherited from the LXC environment by
+   OpenRC and SSH/git-shell processes. Deploy validates presence but never
+   displays or manages their values.
 
 ## Consequences
 

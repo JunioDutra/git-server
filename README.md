@@ -6,23 +6,21 @@ build multiple container images through a remote BuildKit daemon.
 
 ## Configuration
 
-Infrastructure destinations and credentials are never hard-coded. Copy
-`.env.example` to `.env` for local operational scripts and fill the required
-values. `.env` is ignored by Git.
+Infrastructure destinations and credentials are never hard-coded. Runtime
+variables must be present in the LXC environment and inherited by both OpenRC
+services and SSH/git-shell processes. The deploy validates their presence in a
+fresh container process without displaying values.
+
+Copy `.env.example` to `.env` only for local operational scripts. `.env` is
+ignored by Git, and its path can be changed with `GIT_SERVER_OPS_ENV_FILE`.
 
 ```bash
 cp .env.example .env
 chmod 0600 .env
 ```
 
-Production hooks and the OpenRC service load `/etc/git-server/build.env` by
-default. Override that path with `GIT_SERVER_ENV_FILE`. Provision it manually;
-`deploy.sh` validates but never creates, copies, displays, or overwrites it.
-
-```bash
-install -d -m 0750 -o root -g git /etc/git-server
-install -m 0640 -o root -g git /path/to/build.env /etc/git-server/build.env
-```
+The application and hooks consume the inherited environment directly; they do
+not load a repository-managed or application-specific environment file.
 
 Required runtime variables:
 
@@ -114,7 +112,7 @@ against traversal.
 
 ## Deploy and operations
 
-Configure `.env`, provision `/etc/git-server/build.env` in the container, then:
+Configure the LXC runtime environment and the local operational `.env`, then:
 
 ```bash
 ./deploy.sh

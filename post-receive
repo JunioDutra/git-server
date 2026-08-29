@@ -14,14 +14,6 @@
 
 set -u
 
-ENV_FILE="${GIT_SERVER_ENV_FILE:-/etc/git-server/build.env}"
-if [ -r "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
-fi
-
 # Resolve the CANONICAL hook dir even when invoked via a symlink
 # (e.g. /home/git/repos/<name>.git/hooks/post-receive -> /home/git/hooks/post-receive).
 # Using readlink -f ensures $0 resolves to the real canonical path, so

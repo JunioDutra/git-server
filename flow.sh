@@ -2,7 +2,7 @@
 # Full flow: create repo via HTTP API, then clone/push over SSH
 set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-ENV_FILE="${GIT_SERVER_ENV_FILE:-$SCRIPT_DIR/.env}"
+ENV_FILE="${GIT_SERVER_OPS_ENV_FILE:-$SCRIPT_DIR/.env}"
 [[ -r "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
 : "${GIT_CONTAINER_IP:?Missing GIT_CONTAINER_IP}"
 : "${GIT_HTTP_PORT:?Missing GIT_HTTP_PORT}"
