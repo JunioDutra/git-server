@@ -28,7 +28,7 @@ Required runtime variables:
 |---|---|
 | `GIT_HTTP_HOST` / `GIT_HTTP_PORT` | HTTP listener |
 | `GIT_SSH_HOST` | Host shown in clone commands |
-| `GIT_DEFAULT_BRANCH` | New-repo branch and branch that receives `latest` |
+| `GIT_DEFAULT_BRANCH` | New-repo branch and fallback for repository `latest` |
 | `REGISTRY_ADDRESS` | Registry host and port, without scheme |
 | `REGISTRY_USER` / `REGISTRY_PASSWORD` | Registry Basic Authentication |
 | `REGISTRY_INSECURE` | `true` for HTTP, `false` for TLS |
@@ -47,10 +47,15 @@ Paths and retention can be overridden with `GIT_REPOS_ROOT`, `GIT_HOOKS_ROOT`,
 A repository opts into builds with a root `repository.yaml`:
 
 ```yaml
+default_branch: master
+
 build:
   - name: api
     context: services/api
     dockerfile: Dockerfile
+    args:
+      APP_ENV: "production"
+      PORT: "8080"
 
   - name: web
     context: services/web
@@ -60,10 +65,13 @@ mirrors:
   - url: git@github.com:example/project.git
 ```
 
-Every build object requires exactly `name`, `context`, and `dockerfile`.
-`dockerfile` is relative to `context`. Names must be lowercase OCI-compatible
-components; duplicate names, absolute paths, traversal, missing files, unknown
-fields, and an empty build list are rejected before any build starts.
+Every build object requires `name`, `context`, and `dockerfile`; `args` is an
+optional string-to-string map. `dockerfile` is relative to `context`. ARG names
+must be Docker identifiers. Names must be lowercase OCI-compatible components;
+duplicate names, absolute paths, traversal, missing files, unknown root/build
+fields, non-string ARG values, and an empty build list are rejected before any
+build starts. The only accepted root fields are `build`, `mirrors`, and
+`default_branch`.
 
 The former top-level `dockerfile:` property is not supported. A repository
 without `build` is treated as build-disabled and may still declare mirrors.
@@ -71,13 +79,15 @@ without `build` is treated as build-disabled and may still declare mirrors.
 Each item publishes:
 
 - `${REGISTRY_ADDRESS}/<repo>/<name>:<short-sha>` for every branch;
-- `${REGISTRY_ADDRESS}/<repo>/<name>:latest` only on `GIT_DEFAULT_BRANCH`.
+- `${REGISTRY_ADDRESS}/<repo>/<name>:latest` only on the repository
+  `default_branch`, falling back to `GIT_DEFAULT_BRANCH` when omitted.
 
 Builds run sequentially. Failure in one item does not prevent later items from
 running, but the worker exits unsuccessfully if any item fails. Authentication
 uses a temporary `DOCKER_CONFIG` and `--password-stdin`; credentials are not
 written to logs. The same authentication is available to BuildKit for private
-base-image pulls and to crane for pushes.
+base-image pulls and to crane for pushes. Build args are non-secret by contract;
+their values are redacted from the recorded command.
 
 ## Hook logs
 
@@ -122,7 +132,9 @@ Configure the LXC runtime environment and the local operational `.env`, then:
 `deploy.sh` derives sources from its own directory, installs Python/PyYAML,
 deploys the HTTP application and all canonical hook workers, refreshes hook
 symlinks, validates syntax, keeps timestamped backups of replaced files,
-restarts OpenRC, and performs a health check.
+updates the OpenRC environment allowlist, restarts SSH and HTTP, and performs a
+retrying health check. The chosen global environment model makes registry
+credentials available to services started by OpenRC and to SSH hook processes.
 
 Other commands:
 

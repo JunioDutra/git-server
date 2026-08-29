@@ -15,7 +15,10 @@ import yaml
 
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
-ALLOWED_BUILD_KEYS = {"name", "context", "dockerfile"}
+ARG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ALLOWED_ROOT_KEYS = {"build", "mirrors", "default_branch"}
+ALLOWED_BUILD_KEYS = {"name", "context", "dockerfile", "args"}
+REQUIRED_BUILD_KEYS = {"name", "context", "dockerfile"}
 REQUIRED_ENV = (
     "REGISTRY_ADDRESS",
     "REGISTRY_USER",
@@ -53,6 +56,40 @@ def validate_relative_path(value, field, allow_dot=False):
     return value
 
 
+def validate_branch_name(value, field="default_branch"):
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"'{field}' must be a non-empty string")
+    value = value.strip()
+    if any(char in value for char in ("\x00", "\r", "\n", "\t")):
+        raise ConfigError(f"'{field}' cannot contain control characters")
+    try:
+        valid = subprocess.run(
+            ["git", "check-ref-format", "--branch", value],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    except OSError as exc:
+        raise ConfigError(f"cannot validate '{field}': {exc}") from exc
+    if not valid:
+        raise ConfigError(f"'{field}' is not a valid Git branch: {value}")
+    return value
+
+
+def parse_build_args(value, label):
+    if not isinstance(value, dict):
+        raise ConfigError(f"'{label}.args' must be a map of strings")
+    parsed = {}
+    for key, arg_value in value.items():
+        if not isinstance(key, str) or not ARG_NAME_RE.fullmatch(key):
+            raise ConfigError(f"'{label}.args' has invalid Docker ARG name: {key}")
+        if not isinstance(arg_value, str):
+            raise ConfigError(f"'{label}.args.{key}' must be a string")
+        if any(char in arg_value for char in ("\x00", "\r", "\n")):
+            raise ConfigError(f"'{label}.args.{key}' cannot contain control characters")
+        parsed[key] = arg_value
+    return dict(sorted(parsed.items()))
+
+
 def parse_build_config(raw):
     try:
         config = yaml.safe_load(raw)
@@ -64,8 +101,17 @@ def parse_build_config(raw):
         raise ConfigError("repository.yaml root must be a mapping")
     if "dockerfile" in config:
         raise ConfigError("legacy 'dockerfile' key is not supported; migrate to 'build' list")
+    unknown_root = sorted((key for key in config if key not in ALLOWED_ROOT_KEYS), key=str)
+    if unknown_root:
+        raise ConfigError(
+            f"repository.yaml has unknown fields: {', '.join(map(str, unknown_root))}"
+        )
+    default_branch = (
+        validate_branch_name(config["default_branch"])
+        if "default_branch" in config else None
+    )
     if "build" not in config:
-        return []
+        return {"default_branch": default_branch, "builds": []}
     builds = config["build"]
     if not isinstance(builds, list) or not builds:
         raise ConfigError("'build' must be a non-empty list")
@@ -76,10 +122,10 @@ def parse_build_config(raw):
         label = f"build[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{label} must be an object")
-        unknown = sorted(set(item) - ALLOWED_BUILD_KEYS)
-        missing = sorted(ALLOWED_BUILD_KEYS - set(item))
+        unknown = sorted((key for key in item if key not in ALLOWED_BUILD_KEYS), key=str)
+        missing = sorted(REQUIRED_BUILD_KEYS - set(item))
         if unknown:
-            raise ConfigError(f"{label} has unknown fields: {', '.join(unknown)}")
+            raise ConfigError(f"{label} has unknown fields: {', '.join(map(str, unknown))}")
         if missing:
             raise ConfigError(f"{label} is missing fields: {', '.join(missing)}")
         name = item["name"]
@@ -88,12 +134,14 @@ def parse_build_config(raw):
         if name in names:
             raise ConfigError(f"duplicate build name: {name}")
         names.add(name)
+        args = parse_build_args(item["args"], label) if "args" in item else {}
         parsed.append({
             "name": name,
             "context": validate_relative_path(item["context"], f"{label}.context", allow_dot=True),
             "dockerfile": validate_relative_path(item["dockerfile"], f"{label}.dockerfile"),
+            "args": args,
         })
-    return parsed
+    return {"default_branch": default_branch, "builds": parsed}
 
 
 def resolve_build_paths(work, build):
@@ -150,8 +198,15 @@ class ExecutionLog:
         self.file.close()
 
 
-def run_command(command, log, env=None, stdin_text=None):
-    printable = ["***" if part == os.environ.get("REGISTRY_PASSWORD") else part for part in command]
+def run_command(command, log, env=None, stdin_text=None, display_command=None):
+    printable = list(command if display_command is None else display_command)
+    sensitive = {
+        value for value in (
+            (env or {}).get("REGISTRY_USER"),
+            (env or {}).get("REGISTRY_PASSWORD"),
+        ) if value
+    }
+    printable = ["<redacted>" if part in sensitive else part for part in printable]
     log.file.write(f"command: {shlex.join(printable)}\n")
     try:
         proc = subprocess.run(
@@ -193,7 +248,16 @@ def registry_login(environ, insecure, log):
         "--username", environ["REGISTRY_USER"],
         "--password-stdin", environ["REGISTRY_ADDRESS"],
     ])
-    return run_command(command, log, env=environ, stdin_text=environ["REGISTRY_PASSWORD"])
+    display_command = [
+        "<redacted>" if part == environ["REGISTRY_USER"] else part for part in command
+    ]
+    return run_command(
+        command,
+        log,
+        env=environ,
+        stdin_text=environ["REGISTRY_PASSWORD"],
+        display_command=display_command,
+    )
 
 
 def ensure_builder(environ, log):
@@ -207,7 +271,8 @@ def ensure_builder(environ, log):
     return run_command(create, log, env=environ)
 
 
-def build_one(repo, branch, sha, build, context, dockerfile, artifact_dir, log_dir, environ, insecure):
+def build_one(repo, branch, sha, build, context, dockerfile, artifact_dir, log_dir, environ,
+              insecure, default_branch):
     short_sha = sha[:12]
     image = f"{environ['REGISTRY_ADDRESS']}/{repo}/{build['name']}"
     metadata = {
@@ -218,19 +283,28 @@ def build_one(repo, branch, sha, build, context, dockerfile, artifact_dir, log_d
         "context": build["context"],
         "dockerfile": build["dockerfile"],
         "image": image,
+        "default_branch": default_branch,
+        "build_args": ",".join(build["args"]) or "-",
     }
     log = ExecutionLog(log_dir, "build", metadata)
     image_tar = pathlib.Path(artifact_dir) / f"image-{build['name']}.tar"
-    code = run_command([
+    command = [
         "docker", "buildx", "build", "--builder", environ["BUILDX_BUILDER"],
         "--output", f"type=docker,dest={image_tar}", "-f", str(dockerfile), str(context),
-    ], log, env=environ)
+    ]
+    display_command = list(command)
+    insert_at = len(command) - 1
+    for key, value in build["args"].items():
+        command[insert_at:insert_at] = ["--build-arg", f"{key}={value}"]
+        display_command[insert_at:insert_at] = ["--build-arg", f"{key}=<redacted>"]
+        insert_at += 2
+    code = run_command(command, log, env=environ, display_command=display_command)
     if code == 0:
         push = ["crane", "push"]
         if insecure:
             push.append("--insecure")
         code = run_command(push + [str(image_tar), f"{image}:{short_sha}"], log, env=environ)
-    if code == 0 and branch == environ["GIT_DEFAULT_BRANCH"]:
+    if code == 0 and branch == default_branch:
         push = ["crane", "push"]
         if insecure:
             push.append("--insecure")
@@ -258,11 +332,15 @@ def execute(repo_bare, branch, sha, repo, environ=None):
             config_path = source / "repository.yaml"
             if not config_path.is_file():
                 return 0
-            builds = parse_build_config(config_path.read_text(encoding="utf-8"))
+            config = parse_build_config(config_path.read_text(encoding="utf-8"))
+            builds = config["builds"]
             if not builds:
                 return 0
             resolved = [(build, *resolve_build_paths(source, build)) for build in builds]
             insecure = validate_environment(environ)
+            default_branch = config["default_branch"] or validate_branch_name(
+                environ["GIT_DEFAULT_BRANCH"], "GIT_DEFAULT_BRANCH"
+            )
         except (ConfigError, OSError) as exc:
             return diagnostic_log(log_dir, "build-config", repo, branch, sha, str(exc))
 
@@ -286,7 +364,7 @@ def execute(repo_bare, branch, sha, repo, environ=None):
         failed = False
         for build, context, dockerfile in resolved:
             if build_one(repo, branch, sha, build, context, dockerfile, artifacts, log_dir,
-                         environ, insecure) != 0:
+                         environ, insecure, default_branch) != 0:
                 failed = True
         return 1 if failed else 0
 
