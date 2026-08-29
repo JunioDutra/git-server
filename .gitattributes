@@ -1,0 +1,4 @@
+*.sh text eol=lf
+*.py text eol=lf
+post-receive text eol=lf
+git-http-server.initd text eol=lf
