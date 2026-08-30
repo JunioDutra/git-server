@@ -1,2 +1,2 @@
-# Runtime dependency used by the multi-build repository.yaml parser.
+# Runtime dependency used by the repository build/task configuration parser.
 PyYAML==6.0.3

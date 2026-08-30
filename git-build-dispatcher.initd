@@ -28,6 +28,7 @@ start_pre() {
     fi
     checkpath -d -m 0750 -o git:git /run/git-server
     checkpath -d -m 0750 -o git:git "${GIT_BUILD_QUEUE_ROOT:-/home/git/build-queue}"
+    checkpath -d -m 0700 -o git:git "${GIT_REPOSITORY_ENV_ROOT:-/home/git/repository-env}"
     checkpath -d -m 0750 -o git:git /home/git/logs
     checkpath -f -m 0640 -o git:git /home/git/logs/build-dispatcher.log
 }

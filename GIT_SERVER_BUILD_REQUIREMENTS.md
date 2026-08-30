@@ -12,7 +12,7 @@ O servidor já executa múltiplos itens de `build` sequencialmente, tenta os ite
 - publicar `latest` somente quando a branch recebida for a `default_branch` do repositório;
 - manter credenciais e valores de autenticação fora dos argumentos e dos logs.
 
-O parser deve continuar rejeitando nomes OCI inválidos, builds duplicados, campos desconhecidos na raiz ou nos builds, caminhos absolutos, traversal, contextos ou Dockerfiles ausentes e listas de build vazias. A raiz aceita somente `build`, `mirrors` e `default_branch`.
+O parser deve continuar rejeitando nomes OCI inválidos, builds duplicados, campos desconhecidos na raiz ou nos builds, caminhos absolutos, traversal, contextos ou Dockerfiles ausentes e listas de build vazias. Com a ADR-0006, a raiz aceita somente `build`, `tasks`, `mirrors` e `default_branch`.
 
 ## Configuração esperada
 

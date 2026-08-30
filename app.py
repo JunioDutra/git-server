@@ -29,6 +29,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
+from repository_variables import VariableStore, VariableStoreError, VariableStorageError
+
 REPOS_ROOT = os.environ.get("GIT_REPOS_ROOT", "/home/git/repos")
 HOOK_LOGS_ROOT = os.environ.get("GIT_HOOK_LOGS_ROOT", "/home/git/logs/hooks")
 HOOK_LOG_RETENTION_DAYS = int(os.environ.get("GIT_HOOK_LOG_RETENTION_DAYS", "30"))
@@ -37,6 +39,7 @@ HOST = os.environ.get("GIT_HTTP_HOST")
 PORT = os.environ.get("GIT_HTTP_PORT")
 GIT_SSH_HOST = os.environ.get("GIT_SSH_HOST")
 GIT_DEFAULT_BRANCH = os.environ.get("GIT_DEFAULT_BRANCH")
+VARIABLE_STORE = VariableStore(os.environ.get("GIT_REPOSITORY_ENV_ROOT"))
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 LOG_ID_RE = re.compile(r"^[A-Za-z0-9._-]+\.log$")
@@ -159,7 +162,7 @@ JS_DELETE_REPO = """
 <script>
 function deleteRepo(name) {
   if (!confirm('Delete repository "' + name + '"?\\nThis cannot be undone.')) return;
-  fetch('/repo/' + encodeURIComponent(name), {method: 'DELETE'})
+  fetch('/repo/' + encodeURIComponent(name), {method: 'DELETE', headers: {'X-GitServer-CSRF': '1'}})
     .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
     .then(function (res) {
       if (res.ok) { location.href = '/'; }
@@ -174,14 +177,14 @@ JS_DELETE_HOOK_LOGS = """
 <script>
 function deleteHookLog(name, logId) {
   if (!confirm('Delete this hook log?\\nThis cannot be undone.')) return;
-  fetch('/repo/' + encodeURIComponent(name) + '/hook-logs/' + encodeURIComponent(logId), {method: 'DELETE'})
+  fetch('/repo/' + encodeURIComponent(name) + '/hook-logs/' + encodeURIComponent(logId), {method: 'DELETE', headers: {'X-GitServer-CSRF': '1'}})
     .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
     .then(function (res) { if (res.ok) location.reload(); else alert('Error: ' + (res.d.error || 'failed')); })
     .catch(function () { alert('Network error'); });
 }
 function clearHookLogs(name) {
   if (!confirm('Delete all hook logs for "' + name + '"?\\nThis cannot be undone.')) return;
-  fetch('/repo/' + encodeURIComponent(name) + '/hook-logs', {method: 'DELETE'})
+  fetch('/repo/' + encodeURIComponent(name) + '/hook-logs', {method: 'DELETE', headers: {'X-GitServer-CSRF': '1'}})
     .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
     .then(function (res) { if (res.ok) location.reload(); else alert('Error: ' + (res.d.error || 'failed')); })
     .catch(function () { alert('Network error'); });
@@ -261,6 +264,8 @@ code{background:#f6f8fa;padding:.1rem .3rem;border-radius:4px;font-size:.85em}
 .repo-command code{flex:1;min-width:0;overflow-wrap:anywhere}
 .btn-copy,.btn-toggle{padding:.35rem .8rem;background:#0969da;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:.8rem}
 .btn-copy:hover,.btn-toggle:hover{background:#0757b8}.btn-toggle:disabled{background:#8c959f;cursor:not-allowed}
+.variables-actions{display:flex;gap:.6rem;margin:1rem 0}.variables-table input[type=password],.variables-table input[type=text]{width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d0d7de;border-radius:5px}
+.variables-message{min-height:1.5rem}.variables-message.ok{color:#1a7f37}.variables-message.err{color:#cf222e}
 .markdown-rendered{line-height:1.6}.markdown-rendered img{max-width:100%}
 .markdown-rendered h1,.markdown-rendered h2,.markdown-rendered h3,.markdown-rendered h4{border-bottom:1px solid #d0d7de;padding-bottom:.3rem;margin-top:1.2rem}
 .markdown-rendered pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:1rem;overflow-x:auto;font-size:.85rem}
@@ -422,6 +427,10 @@ def delete_bare_repo(name):
     path = os.path.join(REPOS_ROOT, f"{name}.git")
     if not os.path.isdir(path):
         return False, f"repo not found: {name}"
+    try:
+        VARIABLE_STORE.delete_repository(name)
+    except (OSError, VariableStoreError):
+        return False, "managed variable cleanup failed"
     shutil.rmtree(path)
     delete_hook_logs(name)
     return True, path
@@ -612,7 +621,7 @@ def index_page():
     msg.className = 'create-msg';
     fetch('/create', {{
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
+      headers: {{'Content-Type': 'application/json', 'X-GitServer-CSRF': '1'}},
       body: JSON.stringify({{name: name}})
     }}).then(function (r) {{
       return r.json().then(function (d) {{ return {{ok: r.ok, d: d}}; }});
@@ -649,7 +658,7 @@ def repo_page(name, repo, sub, branch, branches):
             body = f"""<h1>{html.escape(name)}</h1>
 {repo_access_panel(name)}
 <p class="muted">Empty repository — no commits yet.</p>
-<p><a href="/repo/{html.escape(name)}/hook-logs">hook logs</a> · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
+<p><a href="/repo/{html.escape(name)}/hook-logs">hook logs</a> · <a href="/repo/{html.escape(name)}/variables">managed variables</a> · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <p><a href="/">← back</a></p>"""
             return page(f"{name} — Git Server", body + JS_DELETE_REPO)
         return None
@@ -686,7 +695,7 @@ def repo_page(name, repo, sub, branch, branches):
 {access_panel}
 <div class="breadcrumb">📁 {breadcrumb}</div>
 {branch_selector(branches, branch)}
-<p><a href="{html.escape(with_branch(f'/repo/{name}/log', branch))}">commit log</a> · <a href="/repo/{html.escape(name)}/hook-logs">hook logs</a> · <a href="/">all repos</a>
+<p><a href="{html.escape(with_branch(f'/repo/{name}/log', branch))}">commit log</a> · <a href="/repo/{html.escape(name)}/hook-logs">hook logs</a> · <a href="/repo/{html.escape(name)}/variables">managed variables</a> · <a href="/">all repos</a>
  · <button class="btn-danger" onclick="deleteRepo('{js_str(name)}')">Delete repository</button></p>
 <table><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
 
@@ -753,6 +762,92 @@ def log_page(name, repo, branch, branches):
     return page(f"{name} — log", body)
 
 
+def variables_page(name):
+    variables = VARIABLE_STORE.list_configured(name)
+    rows = []
+    for item in variables:
+        variable_name = html.escape(item["name"], quote=True)
+        rows.append(f"""<tr class="existing-variable" data-name="{variable_name}">
+<td><code>{variable_name}</code></td>
+<td><input class="variable-value" type="password" value="" placeholder="***" autocomplete="new-password" disabled></td>
+<td><label><input class="variable-replace" type="checkbox"> Replace</label></td>
+<td><label><input class="variable-delete" type="checkbox"> Delete</label></td>
+</tr>""")
+    existing_rows = "".join(rows) or '<tr id="empty-variables"><td colspan="4" class="muted">No managed variables configured.</td></tr>'
+    body = f"""<h1>{html.escape(name)} — managed variables</h1>
+<p><a href="/repo/{html.escape(name)}/">← repository</a></p>
+<p class="muted">Values are never returned. An untouched field preserves its configured value.</p>
+<table class="variables-table"><thead><tr><th>Name</th><th>New value</th><th>Replace</th><th>Delete</th></tr></thead>
+<tbody id="variable-rows">{existing_rows}</tbody></table>
+<div class="variables-actions"><button id="add-variable" class="btn-secondary" type="button">Add variable</button>
+<button id="save-variables" type="button">Save changes</button></div>
+<p id="variables-message" class="variables-message"></p>
+<script>
+(function () {{
+  var repo = {js_json(name)};
+  var rows = document.getElementById('variable-rows');
+  var message = document.getElementById('variables-message');
+  function bindExisting(row) {{
+    var replace = row.querySelector('.variable-replace');
+    var value = row.querySelector('.variable-value');
+    var remove = row.querySelector('.variable-delete');
+    replace.addEventListener('change', function () {{
+      value.disabled = !replace.checked;
+      if (replace.checked) value.focus();
+    }});
+    remove.addEventListener('change', function () {{
+      replace.disabled = remove.checked;
+      value.disabled = remove.checked || !replace.checked;
+    }});
+  }}
+  Array.prototype.forEach.call(rows.querySelectorAll('.existing-variable'), bindExisting);
+  document.getElementById('add-variable').addEventListener('click', function () {{
+    var empty = document.getElementById('empty-variables');
+    if (empty) empty.remove();
+    var row = document.createElement('tr');
+    row.className = 'new-variable';
+    row.innerHTML = '<td><input class="new-name" type="text" placeholder="VARIABLE_NAME" autocomplete="off"></td>' +
+      '<td><input class="new-value" type="password" autocomplete="new-password"></td>' +
+      '<td class="muted">New</td><td><button type="button" class="btn-danger remove-new">Remove</button></td>';
+    row.querySelector('.remove-new').addEventListener('click', function () {{ row.remove(); }});
+    rows.appendChild(row);
+    row.querySelector('.new-name').focus();
+  }});
+  document.getElementById('save-variables').addEventListener('click', function () {{
+    var upsert = {{}};
+    var remove = [];
+    Array.prototype.forEach.call(rows.querySelectorAll('.existing-variable'), function (row) {{
+      var name = row.getAttribute('data-name');
+      if (row.querySelector('.variable-delete').checked) remove.push(name);
+      else if (row.querySelector('.variable-replace').checked) upsert[name] = row.querySelector('.variable-value').value;
+    }});
+    Array.prototype.forEach.call(rows.querySelectorAll('.new-variable'), function (row) {{
+      var name = row.querySelector('.new-name').value.trim();
+      if (name) upsert[name] = row.querySelector('.new-value').value;
+    }});
+    message.textContent = '';
+    message.className = 'variables-message';
+    fetch('/api/repo/' + encodeURIComponent(repo) + '/variables', {{
+      method: 'PATCH',
+      headers: {{'Content-Type': 'application/json', 'X-GitServer-CSRF': '1'}},
+      body: JSON.stringify({{upsert: upsert, delete: remove}})
+    }}).then(function (response) {{
+      return response.json().then(function (data) {{ return {{ok: response.ok, data: data}}; }});
+    }}).then(function (result) {{
+      if (!result.ok) throw new Error(result.data.error || 'failed');
+      message.textContent = '✓ Variables saved without revealing their values.';
+      message.className = 'variables-message ok';
+      setTimeout(function () {{ location.reload(); }}, 700);
+    }}).catch(function (error) {{
+      message.textContent = '✗ ' + error.message;
+      message.className = 'variables-message err';
+    }});
+  }});
+}})();
+</script>"""
+    return page(f"{name} — managed variables", body)
+
+
 def hook_logs_page(name):
     records = list_hook_logs(name)
     current = [record for record in records if not record["legacy"]]
@@ -766,13 +861,13 @@ def hook_logs_page(name):
                             "legacy": "legacy"}.get(status, status)
             status_class = {"ok": "status-ok", "failed": "status-failed", "open": "status-open"}.get(status, "muted")
             detail = record.get("detail") or "—"
-            build_name = record.get("build") or "—"
+            execution_name = record.get("task") or record.get("build") or "—"
             image = record.get("image") or "—"
             started = record.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record["mtime"]))
             href = f"/repo/{name}/hook-logs/{record['id']}"
             rows.append(
                 f'<tr><td><a href="{html.escape(href, quote=True)}">{html.escape(started)}</a></td>'
-                f'<td>{html.escape(record["type"])}</td><td><code>{html.escape(build_name)}</code></td>'
+                f'<td>{html.escape(record["type"])}</td><td><code>{html.escape(execution_name)}</code></td>'
                 f'<td><code>{html.escape(detail)}</code></td><td><code>{html.escape(image)}</code></td>'
                 f'<td>{record["size"]:,} bytes</td><td class="{status_class}">{status_label}</td>'
                 f'<td><button class="btn-danger" onclick="deleteHookLog(\'{js_str(name)}\', \'{js_str(record["id"])}\')">Delete</button></td></tr>'
@@ -784,12 +879,12 @@ def hook_logs_page(name):
     if legacy:
         legacy_section = f"""<h2>Legacy aggregate logs</h2>
 <p class="muted">These files contain multiple executions recorded before per-execution logging was introduced.</p>
-<table><thead><tr><th>Started</th><th>Type</th><th>Build</th><th>Branch / refs</th><th>Image</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{render_rows(legacy)}</tbody></table>"""
+<table><thead><tr><th>Started</th><th>Type</th><th>Build / task</th><th>Branch / refs</th><th>Image</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{render_rows(legacy)}</tbody></table>"""
     body = f"""<h1>{html.escape(name)} — hook logs</h1>
 <p><a href="/repo/{html.escape(name)}/">← files</a> · <a href="/">all repos</a></p>
 <p><button class="btn-danger" onclick="clearHookLogs('{js_str(name)}')">Delete all logs</button></p>
 <h2>Hook executions</h2>
-<table><thead><tr><th>Started</th><th>Type</th><th>Build</th><th>Branch / refs</th><th>Image</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{current_rows}</tbody></table>
+<table><thead><tr><th>Started</th><th>Type</th><th>Build / task</th><th>Branch / refs</th><th>Image</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>{current_rows}</tbody></table>
 {legacy_section}"""
     return page(f"{name} — hook logs", body + JS_DELETE_HOOK_LOGS)
 
@@ -811,7 +906,7 @@ def hook_log_detail_page(name, log_id):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "GitServer/0.2"
+    server_version = "GitServer/0.3"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} - {fmt % args}")
@@ -826,6 +921,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, payload):
         self._send(status, json.dumps(payload), "application/json")
+
+    def _read_json(self, maximum=20 * 1024 * 1024):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError as exc:
+            raise ValueError("invalid content length") from exc
+        if length < 1 or length > maximum:
+            raise ValueError("invalid request size")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid JSON body") from exc
+        return payload
 
     def _send_file(self, path, filename):
         try:
@@ -866,6 +974,32 @@ class Handler(BaseHTTPRequestHandler):
         else:
             status = 409 if "already exists" in msg else 400
             self._send_json(status, {"ok": False, "error": msg})
+
+    def do_PATCH(self):
+        path = urlparse(self.path).path.rstrip("/")
+        match = re.fullmatch(r"/api/repo/([A-Za-z0-9._-]+)/variables", path)
+        if not match:
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        name = match.group(1)
+        if repo_path(name) is None:
+            self._send_json(404, {"ok": False, "error": "repo not found"})
+            return
+        try:
+            payload = self._read_json()
+            if not isinstance(payload, dict) or set(payload) != {"upsert", "delete"}:
+                raise ValueError("invalid variable patch")
+            variables = VARIABLE_STORE.patch(name, payload["upsert"], payload["delete"])
+        except VariableStorageError:
+            self._send_json(500, {"ok": False, "error": "managed variable storage unavailable"})
+            return
+        except (ValueError, VariableStoreError):
+            self._send_json(400, {"ok": False, "error": "invalid variable patch"})
+            return
+        except OSError:
+            self._send_json(500, {"ok": False, "error": "managed variable storage unavailable"})
+            return
+        self._send_json(200, {"variables": variables})
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
@@ -913,6 +1047,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, index_page())
             return
 
+        api_match = re.fullmatch(r"/api/repo/([A-Za-z0-9._-]+)/variables", path)
+        if api_match:
+            name = api_match.group(1)
+            if repo_path(name) is None:
+                self._send_json(404, {"ok": False, "error": "repo not found"})
+                return
+            try:
+                variables = VARIABLE_STORE.list_configured(name)
+            except (OSError, VariableStoreError):
+                self._send_json(500, {"ok": False, "error": "managed variable storage unavailable"})
+                return
+            self._send_json(200, {"variables": variables})
+            return
+
         # /repo/<name>/... routes
         if path.startswith("/repo/"):
             parts = path[len("/repo/"):].split("/", 1)
@@ -924,6 +1072,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if rest == "hook-logs":
                 self._send(200, hook_logs_page(name))
+                return
+            if rest == "variables":
+                try:
+                    output = variables_page(name)
+                except (OSError, VariableStoreError):
+                    self._send(500, page("Error", "<p>Managed variable storage unavailable.</p>"))
+                    return
+                self._send(200, output)
                 return
             if rest.startswith("hook-logs/"):
                 log_rest = rest[len("hook-logs/"):]

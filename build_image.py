@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
-"""Build every image declared in repository.yaml and log each item separately."""
+"""Run the build-and-task pipeline declared in repository.yaml."""
 
 import datetime as dt
+import codecs
 import os
 import pathlib
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 import yaml
+
+from repository_variables import VariableStore, VariableStoreError
 
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 ARG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-ALLOWED_ROOT_KEYS = {"build", "mirrors", "default_branch"}
+ALLOWED_ROOT_KEYS = {"build", "tasks", "mirrors", "default_branch"}
 ALLOWED_BUILD_KEYS = {"name", "context", "dockerfile", "args"}
 REQUIRED_BUILD_KEYS = {"name", "context", "dockerfile"}
+ALLOWED_TASK_KEYS = {"name", "run", "branches", "timeout_seconds"}
+REQUIRED_TASK_KEYS = {"name", "run"}
+ALLOWED_MIRROR_KEYS = {"url", "branches"}
+MAX_TASK_SCRIPT_BYTES = 64 * 1024
+DEFAULT_TASK_TIMEOUT = 900
+MAX_TASK_TIMEOUT = 3600
+MAX_TASK_LOG_BYTES = 10 * 1024 * 1024
+MAX_TASK_NAME_LENGTH = 128
+MAX_TASK_BRANCHES = 128
+TASK_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 REQUIRED_ENV = (
     "REGISTRY_ADDRESS",
     "REGISTRY_USER",
@@ -110,14 +125,11 @@ def parse_build_config(raw):
         validate_branch_name(config["default_branch"])
         if "default_branch" in config else None
     )
-    if "build" not in config:
-        return {"default_branch": default_branch, "builds": []}
-    builds = config["build"]
-    if not isinstance(builds, list) or not builds:
-        raise ConfigError("'build' must be a non-empty list")
-
-    parsed = []
+    parsed_builds = []
     names = set()
+    builds = config.get("build", [])
+    if "build" in config and (not isinstance(builds, list) or not builds):
+        raise ConfigError("'build' must be a non-empty list")
     for index, item in enumerate(builds, start=1):
         label = f"build[{index}]"
         if not isinstance(item, dict):
@@ -135,13 +147,107 @@ def parse_build_config(raw):
             raise ConfigError(f"duplicate build name: {name}")
         names.add(name)
         args = parse_build_args(item["args"], label) if "args" in item else {}
-        parsed.append({
+        parsed_builds.append({
             "name": name,
             "context": validate_relative_path(item["context"], f"{label}.context", allow_dot=True),
             "dockerfile": validate_relative_path(item["dockerfile"], f"{label}.dockerfile"),
             "args": args,
         })
-    return {"default_branch": default_branch, "builds": parsed}
+    parsed_tasks = []
+    task_names = set()
+    tasks = config.get("tasks", [])
+    if "tasks" in config and (not isinstance(tasks, list) or not tasks):
+        raise ConfigError("'tasks' must be a non-empty list")
+    for index, item in enumerate(tasks, start=1):
+        label = f"tasks[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{label} must be an object")
+        unknown = sorted((key for key in item if key not in ALLOWED_TASK_KEYS), key=str)
+        missing = sorted(REQUIRED_TASK_KEYS - set(item))
+        if unknown:
+            raise ConfigError(f"{label} has unknown fields: {', '.join(map(str, unknown))}")
+        if missing:
+            raise ConfigError(f"{label} is missing fields: {', '.join(missing)}")
+        name = item["name"]
+        if (not isinstance(name, str) or not NAME_RE.fullmatch(name)
+                or len(name) > MAX_TASK_NAME_LENGTH):
+            raise ConfigError(f"{label}.name must be a lowercase task name")
+        if name in task_names:
+            raise ConfigError(f"duplicate task name: {name}")
+        task_names.add(name)
+        script = item["run"]
+        if not isinstance(script, str) or not script.strip():
+            raise ConfigError(f"'{label}.run' must be a non-empty string")
+        if "\x00" in script:
+            raise ConfigError(f"'{label}.run' cannot contain NUL")
+        try:
+            script_size = len(script.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ConfigError(f"'{label}.run' must be valid UTF-8") from exc
+        if script_size > MAX_TASK_SCRIPT_BYTES:
+            raise ConfigError(f"'{label}.run' exceeds {MAX_TASK_SCRIPT_BYTES} bytes")
+        branches = None
+        if "branches" in item:
+            raw_branches = item["branches"]
+            if (not isinstance(raw_branches, list) or not raw_branches
+                    or len(raw_branches) > MAX_TASK_BRANCHES):
+                raise ConfigError(f"'{label}.branches' must be a non-empty bounded list")
+            branches = []
+            for branch_index, value in enumerate(raw_branches, start=1):
+                branch = validate_branch_name(value, f"{label}.branches[{branch_index}]")
+                if branch in branches:
+                    raise ConfigError(f"'{label}.branches' contains duplicate branch: {branch}")
+                branches.append(branch)
+        timeout = item.get("timeout_seconds", DEFAULT_TASK_TIMEOUT)
+        if (isinstance(timeout, bool) or not isinstance(timeout, int)
+                or timeout < 1 or timeout > MAX_TASK_TIMEOUT):
+            raise ConfigError(
+                f"'{label}.timeout_seconds' must be between 1 and {MAX_TASK_TIMEOUT}"
+            )
+        parsed_tasks.append({
+            "name": name,
+            "run": script,
+            "branches": branches,
+            "timeout_seconds": timeout,
+        })
+
+    parsed_mirrors = []
+    mirrors = config.get("mirrors", [])
+    if not isinstance(mirrors, list):
+        raise ConfigError("'mirrors' must be a list")
+    for index, item in enumerate(mirrors, start=1):
+        label = f"mirrors[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{label} must be an object")
+        unknown = sorted((key for key in item if key not in ALLOWED_MIRROR_KEYS), key=str)
+        if unknown:
+            raise ConfigError(f"{label} has unknown fields: {', '.join(map(str, unknown))}")
+        if "url" not in item:
+            raise ConfigError(f"{label} is missing fields: url")
+        url = item["url"]
+        if (not isinstance(url, str) or not url.strip()
+                or any(char in url for char in ("\x00", "\r", "\n", "\t"))
+                or not url.startswith(("ssh://", "git@", "http://", "https://"))):
+            raise ConfigError(f"'{label}.url' must be a supported remote URL")
+        branches = None
+        if "branches" in item:
+            raw_branches = item["branches"]
+            if not isinstance(raw_branches, list) or not raw_branches:
+                raise ConfigError(f"'{label}.branches' must be a non-empty list")
+            branches = []
+            for branch_index, value in enumerate(raw_branches, start=1):
+                branch = validate_branch_name(value, f"{label}.branches[{branch_index}]")
+                if branch in branches:
+                    raise ConfigError(f"'{label}.branches' contains duplicate branch: {branch}")
+                branches.append(branch)
+        parsed_mirrors.append({"url": url.strip(), "branches": branches})
+
+    return {
+        "default_branch": default_branch,
+        "builds": parsed_builds,
+        "tasks": parsed_tasks,
+        "mirrors": parsed_mirrors,
+    }
 
 
 def resolve_build_paths(work, build):
@@ -218,7 +324,7 @@ def run_command(command, log, env=None, stdin_text=None, display_command=None):
             env=env,
         )
         return proc.returncode
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         log.file.write(f"cannot execute {command[0]}: {exc}\n")
         return 127
 
@@ -317,6 +423,181 @@ def build_one(repo, branch, sha, build, context, dockerfile, artifact_dir, log_d
     return code
 
 
+def task_environment(repo, branch, sha, default_branch, managed, temporary_dir):
+    environment = dict(managed)
+    environment.update({
+        "PATH": TASK_PATH,
+        "HOME": "/home/git",
+        "USER": "git",
+        "LOGNAME": "git",
+        "TMPDIR": str(temporary_dir),
+        "GIT_SERVER_REPOSITORY": repo,
+        "GIT_SERVER_BRANCH": branch,
+        "GIT_SERVER_SHA": sha,
+        "GIT_SERVER_SHORT_SHA": sha[:12],
+        "GIT_SERVER_DEFAULT_BRANCH": default_branch,
+    })
+    return environment
+
+
+def redact_task_output(output, secrets):
+    redacted = output
+    encoded = sorted(
+        {value.encode("utf-8") for value in secrets if value},
+        key=len,
+        reverse=True,
+    )
+    for value in encoded:
+        redacted = redacted.replace(value, b"***")
+    return redacted
+
+
+def safe_redaction_cutoff(buffer, patterns):
+    if not patterns:
+        return len(buffer)
+    cutoff = max(0, len(buffer) - max(len(pattern) for pattern in patterns) + 1)
+    while cutoff:
+        changed = False
+        for pattern in patterns:
+            search_from = max(0, cutoff - len(pattern) + 1)
+            found = buffer.find(pattern, search_from)
+            while found != -1 and found < cutoff:
+                if found + len(pattern) > cutoff:
+                    cutoff = found
+                    changed = True
+                    break
+                found = buffer.find(pattern, found + 1)
+            if changed:
+                break
+        if not changed:
+            break
+    return cutoff
+
+
+def stream_task_output(source, log, secrets, limit=MAX_TASK_LOG_BYTES):
+    patterns = sorted(
+        {value.encode("utf-8") for value in secrets if value},
+        key=len,
+        reverse=True,
+    )
+    pending = bytearray()
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    written = 0
+    truncated = False
+    try:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            if written >= limit:
+                truncated = True
+                continue
+            pending.extend(chunk)
+            cutoff = safe_redaction_cutoff(pending, patterns)
+            if cutoff:
+                redacted = redact_task_output(bytes(pending[:cutoff]), secrets)
+                del pending[:cutoff]
+                allowed = limit - written
+                emitted = redacted[:allowed]
+                log.file.write(decoder.decode(emitted, final=False))
+                written += len(emitted)
+                if len(redacted) > allowed:
+                    truncated = True
+        if written < limit and pending:
+            redacted = redact_task_output(bytes(pending), secrets)
+            allowed = limit - written
+            emitted = redacted[:allowed]
+            log.file.write(decoder.decode(emitted, final=False))
+            written += len(emitted)
+            if len(redacted) > allowed:
+                truncated = True
+        elif pending:
+            truncated = True
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            log.file.write(tail)
+        return {"written": written, "truncated": truncated, "error": None}
+    except (OSError, ValueError) as exc:
+        return {"written": written, "truncated": truncated, "error": exc}
+
+
+def run_task(repo, branch, sha, task, source, log_dir, default_branch, managed):
+    metadata = {
+        "repo": repo,
+        "task": task["name"],
+        "branch": branch,
+        "sha": sha,
+        "default_branch": default_branch,
+        "timeout_seconds": task["timeout_seconds"],
+    }
+    log = ExecutionLog(log_dir, "task", metadata)
+    task_tmp = tempfile.mkdtemp(prefix=f"git-task-{task['name']}-")
+    environment = task_environment(
+        repo, branch, sha, default_branch, managed, task_tmp
+    )
+    output_state = {"written": 0, "truncated": False, "error": None}
+    timed_out = False
+    proc = None
+
+    def drain_output():
+        output_state.update(
+            stream_task_output(proc.stdout, log, managed.values(), MAX_TASK_LOG_BYTES)
+        )
+
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-eu", "-c", task["run"]],
+            cwd=source,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=environment,
+            start_new_session=True,
+            umask=0o077,
+        )
+        reader = threading.Thread(target=drain_output, name=f"task-log-{task['name']}", daemon=True)
+        reader.start()
+        try:
+            code = proc.wait(timeout=task["timeout_seconds"])
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+            code = 124
+        reader.join(timeout=5)
+        if reader.is_alive() and proc.stdout:
+            proc.stdout.close()
+            reader.join(timeout=1)
+        if output_state["error"] is not None and code == 0:
+            code = 1
+    except OSError as exc:
+        log.file.write(f"cannot execute task shell: {exc}\n")
+        code = 127
+    finally:
+        shutil.rmtree(task_tmp, ignore_errors=True)
+
+    if output_state["written"]:
+        log.file.write("\n")
+    if output_state["truncated"]:
+        log.file.write(f"[output truncated after {MAX_TASK_LOG_BYTES} bytes]\n")
+    if output_state["error"] is not None:
+        log.file.write("[failed to read complete task output]\n")
+    if timed_out:
+        log.write_meta("timed_out", "true")
+    log.finish(code)
+    return code
+
+
 def execute(repo_bare, branch, sha, repo, environ=None):
     environ = dict(os.environ if environ is None else environ)
     log_root = environ.get("GIT_HOOK_LOGS_ROOT", "/home/git/logs/hooks")
@@ -334,39 +615,66 @@ def execute(repo_bare, branch, sha, repo, environ=None):
                 return 0
             config = parse_build_config(config_path.read_text(encoding="utf-8"))
             builds = config["builds"]
-            if not builds:
+            tasks = config["tasks"]
+            if not builds and not tasks:
                 return 0
             resolved = [(build, *resolve_build_paths(source, build)) for build in builds]
-            insecure = validate_environment(environ)
+            insecure = validate_environment(environ) if builds else False
             default_branch = config["default_branch"] or validate_branch_name(
-                environ["GIT_DEFAULT_BRANCH"], "GIT_DEFAULT_BRANCH"
+                environ.get("GIT_DEFAULT_BRANCH"), "GIT_DEFAULT_BRANCH"
             )
         except (ConfigError, OSError) as exc:
             return diagnostic_log(log_dir, "build-config", repo, branch, sha, str(exc))
 
-        docker_config = root / "docker-config"
-        docker_config.mkdir()
-        environ["DOCKER_CONFIG"] = str(docker_config)
-        auth_log = ExecutionLog(log_dir, "build-auth", {"repo": repo, "branch": branch, "sha": sha})
-        auth_code = registry_login(environ, insecure, auth_log)
-        auth_log.finish(auth_code)
-        if auth_code != 0:
-            return auth_code
-        os.remove(auth_log.path)
+        if builds:
+            docker_config = root / "docker-config"
+            docker_config.mkdir()
+            environ["DOCKER_CONFIG"] = str(docker_config)
+            auth_log = ExecutionLog(
+                log_dir, "build-auth", {"repo": repo, "branch": branch, "sha": sha}
+            )
+            auth_code = registry_login(environ, insecure, auth_log)
+            auth_log.finish(auth_code)
+            if auth_code != 0:
+                return auth_code
+            os.remove(auth_log.path)
 
-        infra_log = ExecutionLog(log_dir, "build-infra", {"repo": repo, "branch": branch, "sha": sha})
-        infra_code = ensure_builder(environ, infra_log)
-        infra_log.finish(infra_code)
-        if infra_code != 0:
-            return infra_code
-        os.remove(infra_log.path)
+            infra_log = ExecutionLog(
+                log_dir, "build-infra", {"repo": repo, "branch": branch, "sha": sha}
+            )
+            infra_code = ensure_builder(environ, infra_log)
+            infra_log.finish(infra_code)
+            if infra_code != 0:
+                return infra_code
+            os.remove(infra_log.path)
 
         failed = False
         for build, context, dockerfile in resolved:
             if build_one(repo, branch, sha, build, context, dockerfile, artifacts, log_dir,
                          environ, insecure, default_branch) != 0:
                 failed = True
-        return 1 if failed else 0
+        if failed:
+            return 1
+
+        matching_tasks = [
+            task for task in tasks
+            if task["branches"] is None or branch in task["branches"]
+        ]
+        if not matching_tasks:
+            return 0
+        try:
+            managed = VariableStore(environ.get("GIT_REPOSITORY_ENV_ROOT")).load(repo)
+        except (VariableStoreError, OSError) as exc:
+            return diagnostic_log(
+                log_dir, "task-config", repo, branch, sha,
+                f"cannot load managed variables: {exc}",
+            )
+        for task in matching_tasks:
+            if run_task(
+                repo, branch, sha, task, source, log_dir, default_branch, managed
+            ) != 0:
+                return 1
+        return 0
 
 
 def main(argv=None):

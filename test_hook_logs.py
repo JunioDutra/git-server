@@ -14,8 +14,9 @@ class HookLogTests(unittest.TestCase):
         self.logs = os.path.join(self.tmp.name, "hooks")
         self.legacy = os.path.join(self.tmp.name, "legacy")
         os.makedirs(os.path.join(self.repos, "demo.git"))
-        self.values = app.REPOS_ROOT, app.HOOK_LOGS_ROOT
+        self.values = app.REPOS_ROOT, app.HOOK_LOGS_ROOT, app.VARIABLE_STORE
         app.REPOS_ROOT, app.HOOK_LOGS_ROOT = self.repos, self.logs
+        app.VARIABLE_STORE = app.VariableStore(os.path.join(self.tmp.name, "variables"))
         self.legacy_paths = lambda name: {
             "legacy-build.log": os.path.join(self.legacy, f"{name}-build.log"),
             "legacy-mirror.log": os.path.join(self.legacy, f"{name}-mirror.log"),
@@ -25,7 +26,7 @@ class HookLogTests(unittest.TestCase):
 
     def tearDown(self):
         self.patch.stop()
-        app.REPOS_ROOT, app.HOOK_LOGS_ROOT = self.values
+        app.REPOS_ROOT, app.HOOK_LOGS_ROOT, app.VARIABLE_STORE = self.values
         self.tmp.cleanup()
 
     def write_log(self, log_id, exit_code=0, content="output", build=None, image=None):

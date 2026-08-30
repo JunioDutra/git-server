@@ -27,5 +27,6 @@ start_pre() {
         return 1
     fi
     checkpath -d -o git:git /opt/git-http-server
+    checkpath -d -m 0700 -o git:git "${GIT_REPOSITORY_ENV_ROOT:-/home/git/repository-env}"
     checkpath -f -o git:git /opt/git-http-server/server.log
 }

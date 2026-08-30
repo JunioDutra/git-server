@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit one Git build job to the local isolated dispatcher."""
+"""Submit one Git pipeline job to the local isolated dispatcher."""
 
 import json
 import os
@@ -50,7 +50,7 @@ def main(argv=None):
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"queued build job {result['id']}")
+    print(f"queued pipeline job {result['id']}")
     return 0
 
 

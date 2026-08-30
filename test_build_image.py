@@ -1,7 +1,9 @@
 import io
 import os
 import pathlib
+import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,6 +22,43 @@ VALID_ENV = {
 
 
 class BuildConfigTests(unittest.TestCase):
+    def test_parses_tasks_and_mirrors(self):
+        config = build_image.parse_build_config("""
+default_branch: main
+tasks:
+  - name: deploy
+    branches: [main]
+    timeout_seconds: 30
+    run: |
+      echo deploy
+mirrors:
+  - url: git@example.test:demo.git
+    branches: [main]
+""")
+        self.assertEqual("deploy", config["tasks"][0]["name"])
+        self.assertEqual(["main"], config["tasks"][0]["branches"])
+        self.assertEqual(30, config["tasks"][0]["timeout_seconds"])
+        self.assertEqual("git@example.test:demo.git", config["mirrors"][0]["url"])
+
+    def test_task_defaults_and_validation(self):
+        config = build_image.parse_build_config("tasks:\n  - name: deploy\n    run: echo ok\n")
+        self.assertEqual(build_image.DEFAULT_TASK_TIMEOUT, config["tasks"][0]["timeout_seconds"])
+        invalid = (
+            "tasks: []\n",
+            "tasks:\n  - name: deploy\n    run: ''\n",
+            "tasks:\n  - name: Deploy\n    run: ok\n",
+            "tasks:\n  - name: deploy\n    run: ok\n  - name: deploy\n    run: again\n",
+            "tasks:\n  - name: deploy\n    run: ok\n    branches: []\n",
+            "tasks:\n  - name: deploy\n    run: ok\n    branches: ['bad branch']\n",
+            "tasks:\n  - name: deploy\n    run: ok\n    timeout_seconds: 0\n",
+            "tasks:\n  - name: deploy\n    run: ok\n    timeout_seconds: 3601\n",
+            "tasks:\n  - name: deploy\n    run: ok\n    shell: bash\n",
+            "mirrors:\n  - url: /local/path\n",
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(build_image.ConfigError):
+                build_image.parse_build_config(raw)
+
     def test_accepts_da_school_contract(self):
         config = build_image.parse_build_config("""
 default_branch: master
@@ -133,6 +172,48 @@ build:
         self.assertEqual(1, result)
         self.assertEqual([("api", "main"), ("web", "main")], attempted)
 
+    @staticmethod
+    def materialize_tasks(_repo, _sha, work):
+        pathlib.Path(work, "repository.yaml").write_text("""
+tasks:
+  - name: main-only
+    branches: [main]
+    run: echo main
+  - name: every-branch
+    run: echo all
+""", encoding="utf-8")
+
+    def test_tasks_only_skips_build_environment_and_filters_branch(self):
+        attempted = []
+        with mock.patch.object(build_image, "materialize_tree", self.materialize_tasks), \
+                mock.patch.object(build_image.VariableStore, "load", return_value={"TOKEN": "secret"}), \
+                mock.patch.object(build_image, "validate_environment") as validate, \
+                mock.patch.object(build_image, "run_task", side_effect=lambda *args: attempted.append(args[3]["name"]) or 0):
+            result = build_image.execute(
+                "repo.git", "feature", "f" * 40, "demo",
+                {"GIT_DEFAULT_BRANCH": "main", "GIT_HOOK_LOGS_ROOT": self.logs},
+            )
+        self.assertEqual(0, result)
+        validate.assert_not_called()
+        self.assertEqual(["every-branch"], attempted)
+
+    def test_task_failure_stops_later_tasks(self):
+        attempted = []
+
+        def fail_first(*args):
+            attempted.append(args[3]["name"])
+            return 1
+
+        with mock.patch.object(build_image, "materialize_tree", self.materialize_tasks), \
+                mock.patch.object(build_image.VariableStore, "load", return_value={}), \
+                mock.patch.object(build_image, "run_task", side_effect=fail_first):
+            result = build_image.execute(
+                "repo.git", "main", "f" * 40, "demo",
+                {"GIT_DEFAULT_BRANCH": "main", "GIT_HOOK_LOGS_ROOT": self.logs},
+            )
+        self.assertEqual(1, result)
+        self.assertEqual(["main-only"], attempted)
+
     def test_one_log_per_build_and_no_password_in_log(self):
         work = pathlib.Path(self.tmp.name) / "work"
         context = work / "api"
@@ -231,6 +312,78 @@ build:
         self.assertNotIn(self.env["REGISTRY_USER"], content)
         self.assertNotIn(self.env["REGISTRY_PASSWORD"], content)
         self.assertIn("<redacted>", content)
+
+    def test_stream_redaction_handles_chunk_boundaries_and_longest_values(self):
+        source = mock.Mock()
+        source.read.side_effect = [b"before token", b"123 and token after", b""]
+        log = mock.Mock()
+        log.file = io.StringIO()
+        state = build_image.stream_task_output(
+            source, log, ["token", "token123"], limit=1024
+        )
+        self.assertEqual("before *** and *** after", log.file.getvalue())
+        self.assertFalse(state["truncated"])
+        self.assertIsNone(state["error"])
+
+    def test_stream_redaction_enforces_recorded_output_limit(self):
+        source = mock.Mock()
+        source.read.side_effect = [b"12345", b"67890", b""]
+        log = mock.Mock()
+        log.file = io.StringIO()
+        state = build_image.stream_task_output(source, log, [], limit=6)
+        self.assertEqual("123456", log.file.getvalue())
+        self.assertTrue(state["truncated"])
+
+    def test_task_environment_is_allowlisted_and_metadata_cannot_be_overridden(self):
+        environment = build_image.task_environment(
+            "demo", "feature", "a" * 40, "main",
+            {"TOKEN": "secret", "GIT_SERVER_REPOSITORY": "attacker"}, "/tmp/task"
+        )
+        self.assertEqual("secret", environment["TOKEN"])
+        self.assertEqual("demo", environment["GIT_SERVER_REPOSITORY"])
+        self.assertEqual("feature", environment["GIT_SERVER_BRANCH"])
+        self.assertNotIn("REGISTRY_PASSWORD", environment)
+        self.assertNotIn("BUILDKIT_ADDRESS", environment)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("/bin/sh"), "POSIX task executor")
+    def test_task_executor_filters_environment_redacts_and_sets_umask(self):
+        source = pathlib.Path(self.tmp.name) / "task-source"
+        source.mkdir()
+        task = {
+            "name": "deploy", "branches": None, "timeout_seconds": 10,
+            "run": "printf '%s\\n' \"$TOKEN\" \"$GIT_SERVER_SHA\" \"${REGISTRY_PASSWORD-unset}\"; touch private",
+        }
+        result = build_image.run_task(
+            "demo", "main", "a" * 40, task, source,
+            os.path.join(self.logs, "demo"), "main", {"TOKEN": "top-secret"},
+        )
+        self.assertEqual(0, result)
+        content = next((pathlib.Path(self.logs) / "demo").glob("*.log")).read_text()
+        self.assertNotIn("top-secret", content)
+        self.assertNotIn(task["run"], content)
+        self.assertIn("***", content)
+        self.assertIn("unset", content)
+        self.assertEqual(0o600, (source / "private").stat().st_mode & 0o777)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("/bin/sh"), "POSIX task executor")
+    def test_task_timeout_and_output_limit(self):
+        source = pathlib.Path(self.tmp.name) / "timeout-source"
+        source.mkdir()
+        task = {
+            "name": "timeout", "branches": None, "timeout_seconds": 1,
+            "run": "printf '1234567890'; sleep 30 & wait",
+        }
+        started = time.monotonic()
+        with mock.patch.object(build_image, "MAX_TASK_LOG_BYTES", 5):
+            result = build_image.run_task(
+                "demo", "main", "b" * 40, task, source,
+                os.path.join(self.logs, "demo"), "main", {},
+            )
+        self.assertEqual(124, result)
+        self.assertLess(time.monotonic() - started, 10)
+        content = next((pathlib.Path(self.logs) / "demo").glob("*.log")).read_text()
+        self.assertIn("# hook-log: timed_out=true", content)
+        self.assertIn("[output truncated after 5 bytes]", content)
 
 
 if __name__ == "__main__":

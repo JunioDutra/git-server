@@ -140,7 +140,7 @@ if [ -n "$BUILD_SPECS" ]; then
     SHA=${rest%%:*}
     SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
     if queue_build "$BRANCH" "$SHA"; then
-      echo "[git-server] queued build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
+      echo "[git-server] queued pipeline for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
     else
       echo "[git-server] failed to queue build for $REPO_NAME@$BRANCH ($SHORT_SHA)" >&2
     fi

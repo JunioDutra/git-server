@@ -144,9 +144,14 @@ class EnvironmentConfigurationTests(unittest.TestCase):
                 configure_build_env.render(environ)
 
     def test_quotes_values_and_omits_unset_optional_values(self):
-        content = configure_build_env.render({**BUILD_ENV, "GIT_BUILD_WORKERS": "2"})
+        content = configure_build_env.render({
+            **BUILD_ENV,
+            "GIT_BUILD_WORKERS": "2",
+            "GIT_REPOSITORY_ENV_ROOT": "/srv/repository env",
+        })
         self.assertIn("export REGISTRY_PASSWORD='p a'\"'\"'ssword'\n", content)
         self.assertIn("export GIT_BUILD_WORKERS=2\n", content)
+        self.assertIn("export GIT_REPOSITORY_ENV_ROOT='/srv/repository env'\n", content)
         self.assertNotIn("GIT_BUILD_QUEUE_ROOT", content)
 
 
