@@ -12,7 +12,12 @@ variables must be present in the LXC environment. The deploy validates their
 presence in a fresh container process without displaying values, then writes
 the build-only values to the protected OpenRC configuration
 `/etc/conf.d/git-build-dispatcher` (`0640 root:git`). Registry credentials are
-not inherited by SSH/git-shell processes.
+not inherited by SSH/git-shell processes. The read-only Homepage statistics
+endpoint uses a root-owned configuration at
+`/etc/git-http-server/homepage.json` (`0640 root:git`) containing only the
+allowed client addresses and a SHA-256 token digest. The plaintext token stays
+in Homepage's `HOMEPAGE_VAR_...` secret mechanism and is never committed to
+this repository or placed in `custom.js`.
 
 Copy `.env.example` to `.env` only for local operational scripts. `.env` is
 ignored by Git, and its path can be changed with `GIT_SERVER_OPS_ENV_FILE`.
@@ -192,7 +197,31 @@ variable file.
 - `GET /repo/<name>/variables` manages masked repository variables.
 - `GET /api/repo/<name>/variables` lists only configured variable names.
 - `PATCH /api/repo/<name>/variables` atomically upserts/deletes variables.
+- `GET /api/homepage/stats` returns authenticated aggregate statistics for
+  Homepage. It requires the `X-Homepage-Token` header and a source address
+  listed in `/etc/git-http-server/homepage.json`.
 - `DELETE /repo/<name>` deletes the repository and its hook logs.
+
+The Homepage stats response has `schemaVersion: 1`, `status`, `generatedAt`,
+`repositories`, `storageBytes`, `buildsRunning`, and `buildsFailed24h`.
+`storageBytes` sums regular files inside the bare repositories only; it excludes
+the build queue, hook logs, build cache, and artifacts. `buildsRunning` counts
+live `build_image.py` children owned by the verified dispatcher process.
+`buildsFailed24h` counts failed structured build executions completed in the
+last 24 UTC hours. It is `null` until at least one structured build record
+establishes a reliable history. Collection results are cached for 60 seconds;
+collection failures are explicit HTTP 503 responses with null metric fields and
+`status: error`, never fabricated zeroes.
+
+The endpoint configuration has this shape, with the real digest kept only on
+the server:
+
+```json
+{
+  "allowedClients": ["192.168.2.198"],
+  "tokenSha256": "<64 lowercase hexadecimal characters>"
+}
+```
 
 All browser mutations send `X-GitServer-CSRF: 1`. Authentication, HTTPS, Origin
 validation, CSRF enforcement, and blocking direct access to the application
@@ -216,12 +245,14 @@ the values, then deploy:
 ```
 
 `deploy.sh` derives sources from its own directory, installs Python/PyYAML,
-deploys the HTTP application, both OpenRC services, the submission client,
+deploys the HTTP application, its stats collector, both OpenRC services, the submission client,
 dispatcher, and canonical hook workers, refreshes hook symlinks, validates
 syntax, and keeps timestamped backups. It removes the old global credential
 allowlist, generates the protected dispatcher configuration, restarts the
 dispatcher and HTTP service (not SSH), and verifies both HTTP and the Unix
-socket.
+socket. The deploy also backs up the prior HTTP secret configuration before
+replacing the application files; it does not overwrite the stats access
+configuration.
 
 After an LXC reboot, OpenRC starts `git-build-dispatcher` and `git-http-server`
 automatically. No manual SSH restart is required. Useful diagnostics:
@@ -245,6 +276,7 @@ The HTTP service must run as `git`; running it as root causes ownership and
 ## Files
 
 - `app.py` — HTTP API and web UI.
+- `homepage_stats.py` - read-only aggregate metrics collector for Homepage.
 - `build_image.py` — build/task parser and pipeline orchestrator.
 - `repository_variables.py` — atomic repository variable store shared by HTTP and worker.
 - `build_submit.py` — credential-free Unix socket client used by the hook.

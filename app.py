@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from repository_variables import VariableStore, VariableStoreError, VariableStorageError
+import homepage_stats
 
 REPOS_ROOT = os.environ.get("GIT_REPOS_ROOT", "/home/git/repos")
 HOOK_LOGS_ROOT = os.environ.get("GIT_HOOK_LOGS_ROOT", "/home/git/logs/hooks")
@@ -1041,6 +1042,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+
+        if path == "/api/homepage/stats":
+            homepage_stats.handle(self, REPOS_ROOT, HOOK_LOGS_ROOT, HOOKS_ROOT)
+            return
+
         requested_branch = (parse_qs(parsed.query).get("ref") or [None])[0]
 
         if path == "/":
